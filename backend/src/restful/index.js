@@ -24,6 +24,7 @@ import registerMiscRoutes from './miscs';
 import registerNodeInfoRoutes from './node-info';
 import registerParserRoutes from './parser';
 import registerLogRoutes from './logs';
+import { createAnalyticsMiddleware, analyticsBeaconMiddleware } from './analytics';
 
 export default function serve() {
     let port;
@@ -33,6 +34,10 @@ export default function serve() {
         host = eval('process.env.SUB_STORE_BACKEND_API_HOST') || '::';
     }
     const $app = express({ substore: $, port, host });
+    
+    // Add Vercel Analytics middleware for HTML injection
+    $app.use(createAnalyticsMiddleware());
+    
     if ($.env.isNode) {
         const be_merge = eval('process.env.SUB_STORE_BACKEND_MERGE');
         const be_prefix = eval('process.env.SUB_STORE_BACKEND_PREFIX');
@@ -141,6 +146,10 @@ export default function serve() {
     registerMiscRoutes($app);
     registerParserRoutes($app);
     registerLogRoutes($app);
+    
+    // Register Vercel Analytics beacon endpoint
+    $app.post('/_vercel/insights', analyticsBeaconMiddleware);
+    $app.options('/_vercel/insights', analyticsBeaconMiddleware);
 
     $app.start();
 
