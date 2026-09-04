@@ -12,6 +12,8 @@
  */
 import { version } from '../package.json';
 import $ from '@/core/app';
+import { injectSpeedInsights } from '@vercel/speed-insights';
+
 console.log(
     `
 ┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅
@@ -21,6 +23,11 @@ console.log(
 );
 import migrate from '@/utils/migration';
 import serve from '@/restful';
+
+// Initialize Vercel Speed Insights
+if ($.env.isNode) {
+    injectSpeedInsights();
+}
 
 migrate();
 serve();
