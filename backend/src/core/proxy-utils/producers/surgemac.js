@@ -11,15 +11,15 @@ const surge_Producer = Surge_Producer();
 
 export default function SurgeMac_Producer() {
     const produce = (proxy, type, opts = {}) => {
-        if (proxy._mihomoExternal) {
-            return mihomo(proxy, type, opts);
-        }
         switch (proxy.type) {
             case 'external':
                 return external(proxy);
             // case 'ssr':
             //     return shadowsocksr(proxy);
             default: {
+                if (opts.mihomoExternal || proxy._mihomoExternal) {
+                    return mihomo(proxy, type, opts) || '';
+                }
                 try {
                     return surge_Producer.produce(proxy, type, opts);
                 } catch (e) {
@@ -27,12 +27,12 @@ export default function SurgeMac_Producer() {
                         opts.useMihomoExternal &&
                         e instanceof SurgeUnsupportedProxyError
                     ) {
-                        const output = mihomo(proxy, type, opts);
+                        const output = mihomo(proxy, type, opts) || '';
                         if (!output) {
                             throw e;
                         }
                         $.log(
-                            `${proxy.name} is not supported on ${targetPlatform}, try to use Mihomo(SurgeMac - External Proxy Program) instead`,
+                            `${proxy.name} is not supported on ${targetPlatform}, try to use mihomo(SurgeMac - External Proxy Program) instead`,
                         );
                         return output;
                     }
@@ -206,10 +206,16 @@ function mihomo(proxy, type, opts) {
                 ...clashProxy,
                 name: proxyName,
             });
-            opts._merged.config = {
-                ...opts._merged.config,
-                ...(opts?.config || proxy._config || {}),
-            };
+            // 只记录覆盖层, 在所有节点都并入后由 index.js 统一合并一次.
+            // 若在这里就合并, 覆盖层里的 proxy-groups 会成为后续节点
+            // `proxy-groups[0].proxies.push()` 的目标, 使 GLOBAL 出现重复项.
+            const configOverride = opts?.config || proxy._config;
+            if (configOverride) {
+                opts._merged.configOverride = {
+                    ...(opts._merged.configOverride || {}),
+                    ...configOverride,
+                };
+            }
         } else {
             const external_proxy = {
                 name: proxy.name,

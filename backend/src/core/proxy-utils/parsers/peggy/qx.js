@@ -1,4 +1,22 @@
+import { Buffer } from 'buffer';
 import peggy from 'peggy';
+
+function decodeQxAlpn(raw) {
+    if (typeof raw !== 'string') return undefined;
+    const hex = raw.trim().replace(/:/g, '');
+    if (!hex || hex.length % 2 || /[^0-9a-f]/i.test(hex)) return undefined;
+
+    const bytes = Buffer.from(hex, 'hex');
+    const alpn = [];
+    for (let offset = 0; offset < bytes.length; ) {
+        const length = bytes[offset++];
+        if (!length || offset + length > bytes.length) return undefined;
+        alpn.push(bytes.subarray(offset, offset + length).toString('utf8'));
+        offset += length;
+    }
+    return alpn;
+}
+
 const grammars = String.raw`
 // global initializer
 {{
@@ -170,7 +188,8 @@ port = digits:[0-9]+ {
 }
 
 username = comma "username" equals username:[^,]+ { proxy.username = username.join("").trim(); }
-password = comma "password" equals password:[^,]+ { proxy.password = password.join("").trim(); }
+password = comma "password" equals password:$((!next_parameter .)+) { proxy.password = password.trim(); }
+next_parameter = "," _ [^=,]+ equals
 uuid = comma "password" equals uuid:[^,]+ { proxy.uuid = uuid.join("").trim(); }
 
 method = comma "method" equals cipher:cipher { 
@@ -187,8 +206,13 @@ fast_open = comma "fast-open" equals flag:bool { proxy.tfo = flag; }
 
 over_tls = comma "over-tls" equals flag:bool { proxy.tls = flag; }
 tls_host = comma sni:("tls-host") equals match:[^,]+ { proxy.sni = match.join("").replace(/^"(.*)"$/, '$1'); }
-tls_verification = comma "tls-verification" equals flag:bool { 
-    proxy["skip-cert-verify"] = !flag;
+tls_verification = comma "tls-verification" equals raw:$[^,]+ {
+    const value = raw.trim();
+    if (value === "true" || value === "false") {
+        proxy["skip-cert-verify"] = value !== "true";
+    } else {
+        proxy["name-cert-verify"] = value;
+    }
 }
 tls_fingerprint = comma "tls-cert-sha256" equals tls_fingerprint:$[^,]+ { proxy["tls-fingerprint"] = tls_fingerprint.trim(); }
 tls_pubkey_sha256 = comma "tls-pubkey-sha256" equals param:$[^=,]+ { proxy["tls-pubkey-sha256"] = param; }
@@ -255,7 +279,15 @@ bool = b:("true"/"false") { return b === "true" }
 let parser;
 export default function getParser() {
     if (!parser) {
-        parser = peggy.generate(grammars);
+        const generated = peggy.generate(grammars);
+        parser = {
+            parse(input, options) {
+                const proxy = generated.parse(input, options);
+                const alpn = decodeQxAlpn(proxy['tls-alpn']);
+                if (alpn) proxy.alpn = alpn;
+                return proxy;
+            },
+        };
     }
     return parser;
 }

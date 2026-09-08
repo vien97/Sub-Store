@@ -4,6 +4,11 @@ import rs from '@/utils/rs';
 import YAML from '@/utils/yaml';
 import download, { downloadFile } from '@/utils/download';
 import {
+    decryptArmorIfPresent,
+    derivePublicKey,
+    encryptArmor,
+} from '@/utils/age';
+import {
     isIPv4,
     isIPv6,
     isValidPortNumber,
@@ -13,7 +18,11 @@ import {
     getRandomPort,
     numberToString,
 } from '@/utils';
-import PROXY_PROCESSORS, { ApplyProcessor } from './processors';
+import PROXY_PROCESSORS, {
+    ApplyProcessor,
+    ApplyResponseTransformer,
+    isResponseTransformerType,
+} from './processors';
 import PROXY_PREPROCESSORS from './preprocessors';
 import PROXY_PRODUCERS from './producers';
 import PROXY_PARSERS from './parsers';
@@ -22,9 +31,9 @@ import { FILES_KEY, MODULES_KEY } from '@/constants';
 import { findByName } from '@/utils/database';
 import { produceArtifact } from '@/restful/sync';
 import { getFlag, removeFlag, getISO, MMDB } from '@/utils/geo';
+import getFs from '@/runtime/fs';
 import Gist from '@/utils/gist';
 import {
-    isPresent,
     isShadowsocksOverTls,
     normalizeWireGuardInterface,
 } from './producers/utils';
@@ -32,6 +41,12 @@ import { doh } from '@/utils/dns';
 import JSON5 from 'json5';
 import { hex_md5 } from '@/vendor/md5';
 import SurgeMac_Producer from './producers/surgemac';
+
+const ageUtils = {
+    encrypt: encryptArmor,
+    decrypt: decryptArmorIfPresent,
+    derivePublicKey,
+};
 
 function preprocess(raw) {
     for (const processor of PROXY_PREPROCESSORS) {
@@ -105,15 +120,56 @@ function parse(raw) {
     });
 }
 
+function shouldSkipByContext(item, context) {
+    const control = context.process;
+    if (!control || typeof control !== 'object') return false;
+
+    const { type, customNames } = control;
+    if (!Array.isArray(customNames)) return false;
+
+    const matched =
+        item.customName != null && customNames.includes(item.customName);
+
+    if (type === 'disable') return matched;
+    if (type === 'enable') return !matched;
+    return false;
+}
+
 async function processFn(
     proxies,
     operators = [],
     targetPlatform,
     source,
     $options,
+    raw,
+    executionContext = {},
 ) {
     let context = {};
+    if (raw !== undefined) {
+        context.raw =
+            Array.isArray(raw) || (raw !== null && typeof raw === 'object')
+                ? raw
+                : [raw];
+    }
     for (const item of operators) {
+        if (isResponseTransformerType(item.type)) {
+            $.log(
+                `Skipping response transformer during proxy/file processing: "${
+                    item.type
+                }" with arguments:\n >>> ${
+                    JSON.stringify(item.args, null, 2) || 'None'
+                }`,
+            );
+            continue;
+        }
+        if (shouldSkipByContext(item, context)) {
+            $.info(
+                `Skipping context-controlled operator: "${
+                    item.type
+                }" with customName "${item.customName || ''}"`,
+            );
+            continue;
+        }
         if (item.disabled) {
             $.log(
                 `Skipping disabled operator: "${
@@ -128,94 +184,10 @@ async function processFn(
         let script;
         let $arguments = {};
         if (item.type.indexOf('Script') !== -1) {
-            const { mode, content } = item.args;
-            if (mode === 'link') {
-                let url = content || '';
-                // extract link arguments
-                const rawArgs = url.split('#');
-                if (rawArgs.length > 1) {
-                    try {
-                        // 支持 `#${encodeURIComponent(JSON.stringify({arg1: "1"}))}`
-                        $arguments = JSON.parse(decodeURIComponent(rawArgs[1]));
-                    } catch (e) {
-                        for (const pair of rawArgs[1].split('&')) {
-                            const key = pair.split('=')[0];
-                            const value = pair.split('=')[1];
-                            // 部分兼容之前的逻辑 const value = pair.split('=')[1] || true;
-                            $arguments[key] =
-                                value == null || value === ''
-                                    ? true
-                                    : decodeURIComponent(value);
-                        }
-                    }
-                }
-                url = `${url.split('#')[0]}${
-                    rawArgs[2]
-                        ? `#${rawArgs[2]}`
-                        : $arguments?.noCache != null ||
-                          $arguments?.insecure != null
-                        ? `#${rawArgs[1]}`
-                        : ''
-                }`;
-                const downloadUrlMatch = url
-                    .split('#')[0]
-                    .match(/^\/api\/(file|module)\/(.+)/);
-                if (downloadUrlMatch) {
-                    let type = '';
-                    try {
-                        type = downloadUrlMatch?.[1];
-                        let name = downloadUrlMatch?.[2];
-                        if (name == null) {
-                            throw new Error(`本地 ${type} URL 无效: ${url}`);
-                        }
-                        name = decodeURIComponent(name);
-                        const key = type === 'module' ? MODULES_KEY : FILES_KEY;
-                        const item = findByName($.read(key), name);
-                        if (!item) {
-                            throw new Error(`找不到 ${type}: ${name}`);
-                        }
-
-                        if (type === 'module') {
-                            script = item.content;
-                        } else {
-                            script = await produceArtifact({
-                                type: 'file',
-                                name,
-                            });
-                        }
-                    } catch (err) {
-                        $.error(
-                            `Error when loading ${type}: ${item.args.content}.\n Reason: ${err}`,
-                        );
-                        throw new Error(`无法加载 ${type}: ${url}`);
-                    }
-                } else if (url?.startsWith('/')) {
-                    try {
-                        const fs = eval(`require("fs")`);
-                        script = fs.readFileSync(url.split('#')[0], 'utf8');
-                        // $.info(`Script loaded: >>>\n ${script}`);
-                    } catch (err) {
-                        $.error(
-                            `Error when reading local script: ${item.args.content}.\n Reason: ${err}`,
-                        );
-                        throw new Error(`无法从该路径读取脚本文件: ${url}`);
-                    }
-                } else {
-                    // if this is a remote script, download it
-                    try {
-                        script = await download(url);
-                        // $.info(`Script loaded: >>>\n ${script}`);
-                    } catch (err) {
-                        $.error(
-                            `Error when downloading remote script: ${item.args.content}.\n Reason: ${err}`,
-                        );
-                        throw new Error(`无法下载脚本: ${url}`);
-                    }
-                }
-            } else {
-                script = content;
-                $arguments = item.args.arguments || {};
-            }
+            ({ script, $arguments } = await loadScriptItem(
+                item,
+                executionContext,
+            ));
         }
 
         if (!PROXY_PROCESSORS[item.type]) {
@@ -239,11 +211,214 @@ async function processFn(
                 context,
             );
         } else {
-            processor = PROXY_PROCESSORS[item.type](item.args || {});
+            processor = PROXY_PROCESSORS[item.type](
+                item.args || {},
+                executionContext,
+            );
         }
         proxies = await ApplyProcessor(processor, proxies);
     }
     return proxies;
+}
+
+async function processResponseFn(
+    response,
+    operators = [],
+    targetPlatform,
+    source,
+    $options,
+    executionContext = {},
+) {
+    let context = {};
+    let output = normalizeResponse(response);
+    for (const item of operators) {
+        if (!isResponseTransformerType(item.type)) continue;
+        if (shouldSkipByContext(item, context)) {
+            $.info(
+                `Skipping context-controlled response transformer: "${
+                    item.type
+                }" with customName "${item.customName || ''}"`,
+            );
+            continue;
+        }
+        if (item.disabled) {
+            $.log(
+                `Skipping disabled response transformer: "${
+                    item.type
+                }" with arguments:\n >>> ${
+                    JSON.stringify(item.args, null, 2) || 'None'
+                }`,
+            );
+            continue;
+        }
+
+        const { script, $arguments } = await loadScriptItem(
+            item,
+            executionContext,
+        );
+        $.log(
+            `Applying "${item.type}" with arguments:\n >>> ${
+                JSON.stringify(item.args, null, 2) || 'None'
+            }`,
+        );
+        const transformer = PROXY_PROCESSORS[item.type](
+            script,
+            targetPlatform,
+            $arguments,
+            source,
+            $options,
+            context,
+        );
+        output = normalizeResponse(
+            await ApplyResponseTransformer(transformer, output),
+        );
+    }
+    return output;
+}
+
+async function loadScriptItem(item, executionContext = {}) {
+    if (
+        $.env.isNode &&
+        !eval('process.env.SUB_STORE_FRONTEND_BACKEND_PATH')?.startsWith('/') &&
+        !eval('process.env.SUB_STORE_BACKEND_CUSTOM_NAME')
+    ) {
+        const message =
+            'Node.js 环境下，脚本操作、脚本过滤和修改响应必须设置 SUB_STORE_FRONTEND_BACKEND_PATH 才能生效；若不想改变当前 path，可设置 SUB_STORE_FRONTEND_BACKEND_PATH=/';
+        $.error(message);
+        throw new Error(message);
+    }
+
+    let script;
+    let $arguments = {};
+    const { mode, content } = item.args || {};
+    if (mode === 'link') {
+        let url = content || '';
+        // extract link arguments
+        const rawArgs = url.split('#');
+        if (rawArgs.length > 1) {
+            try {
+                // 支持 `#${encodeURIComponent(JSON.stringify({arg1: "1"}))}`
+                $arguments = JSON.parse(decodeURIComponent(rawArgs[1]));
+            } catch (e) {
+                for (const pair of rawArgs[1].split('&')) {
+                    const key = pair.split('=')[0];
+                    const value = pair.split('=')[1];
+                    // 部分兼容之前的逻辑 const value = pair.split('=')[1] || true;
+                    $arguments[key] =
+                        value == null || value === ''
+                            ? true
+                            : decodeURIComponent(value);
+                }
+            }
+        }
+        url = `${url.split('#')[0]}${
+            rawArgs[2]
+                ? `#${rawArgs[2]}`
+                : $arguments?.noCache != null || $arguments?.insecure != null
+                ? `#${rawArgs[1]}`
+                : ''
+        }`;
+        const downloadUrlMatch = url
+            .split('#')[0]
+            .match(/^\/api\/(file|module)\/(.+)/);
+        if (downloadUrlMatch) {
+            let type = '';
+            try {
+                type = downloadUrlMatch?.[1];
+                let name = downloadUrlMatch?.[2];
+                if (name == null) {
+                    throw new Error(`本地 ${type} URL 无效: ${url}`);
+                }
+                name = decodeURIComponent(name);
+                const key = type === 'module' ? MODULES_KEY : FILES_KEY;
+                const localItem = findByName($.read(key), name);
+                if (!localItem) {
+                    throw new Error(`找不到 ${type}: ${name}`);
+                }
+
+                if (type === 'module') {
+                    script = localItem.content;
+                } else {
+                    script = await produceArtifact({
+                        type: 'file',
+                        name,
+                        noFlow: executionContext.noFlow,
+                    });
+                }
+            } catch (err) {
+                $.error(
+                    `Error when loading ${type}: ${item.args.content}.\n Reason: ${err}`,
+                );
+                throw new Error(`无法加载 ${type}: ${url}`);
+            }
+        } else if (url?.startsWith('/')) {
+            try {
+                const fs = getFs();
+                script = fs.readFileSync(url.split('#')[0], 'utf8');
+                // $.info(`Script loaded: >>>\n ${script}`);
+            } catch (err) {
+                $.error(
+                    `Error when reading local script: ${item.args.content}.\n Reason: ${err}`,
+                );
+                throw new Error(`无法从该路径读取脚本文件: ${url}`);
+            }
+        } else {
+            // if this is a remote script, download it
+            try {
+                script = await download(
+                    url,
+                    undefined,
+                    undefined,
+                    undefined,
+                    undefined,
+                    undefined,
+                    undefined,
+                    undefined,
+                    { noFlow: executionContext.noFlow },
+                );
+                // $.info(`Script loaded: >>>\n ${script}`);
+            } catch (err) {
+                $.error(
+                    `Error when downloading remote script: ${item.args.content}.\n Reason: ${err}`,
+                );
+                throw new Error(`无法下载脚本: ${url}`);
+            }
+        }
+    } else {
+        script = content;
+        $arguments = item.args?.arguments || {};
+    }
+    return { script, $arguments };
+}
+
+function normalizeResponse(response = {}) {
+    let headers = response.header || response.headers || {};
+    if (!headers || typeof headers !== 'object') headers = {};
+    const normalized = {
+        status: response.status || response.statusCode || 200,
+        body: Object.prototype.hasOwnProperty.call(response, 'body')
+            ? response.body
+            : '',
+    };
+    Object.defineProperty(normalized, 'headers', {
+        enumerable: true,
+        get() {
+            return headers;
+        },
+        set(value) {
+            headers = value && typeof value === 'object' ? value : {};
+        },
+    });
+    Object.defineProperty(normalized, 'header', {
+        enumerable: true,
+        get() {
+            return headers;
+        },
+        set(value) {
+            headers = value && typeof value === 'object' ? value : {};
+        },
+    });
+    return normalized;
 }
 
 function produce(proxies, targetPlatform, type, opts = {}) {
@@ -253,27 +428,40 @@ function produce(proxies, targetPlatform, type, opts = {}) {
     }
 
     const normalizedTarget = String(targetPlatform).toLowerCase();
-    const supportedShadowsocksOverTlsTargets = new Set([
-        'qx',
-        'quantumultx',
-        'shadowrocket',
-    ]);
-
-    const sni_off_supported = /Surge|SurgeMac|Shadowrocket/i.test(
-        targetPlatform,
-    );
 
     // filter unsupported proxies
     proxies = proxies.filter((proxy) => {
+        const includeUnsupportedProxy = opts['include-unsupported-proxy'];
+
         // 检查代理是否支持目标平台
-        if (proxy.supported && proxy.supported[targetPlatform] === false) {
+        if (
+            !includeUnsupportedProxy &&
+            proxy.supported &&
+            proxy.supported[targetPlatform] === false
+        ) {
             return false;
         }
 
         if (
+            !includeUnsupportedProxy &&
+            hasRootProxyHeaders(proxy) &&
+            isRootHeaderSensitiveProxy(proxy) &&
+            !supportsRootProxyHeaders(proxy, targetPlatform)
+        ) {
+            $.error(
+                `Target platform ${targetPlatform} does not support headers for ${getRootHeaderProxyLabel(
+                    proxy,
+                )} proxy ${
+                    proxy.name || `${proxy.server}:${proxy.port}`
+                }. Proxy has been filtered.`,
+            );
+            return false;
+        }
+
+        if (
+            !includeUnsupportedProxy &&
             isShadowsocksOverTls(proxy) &&
-            !supportedShadowsocksOverTlsTargets.has(normalizedTarget) &&
-            !opts['include-unsupported-proxy']
+            !['qx', 'quantumultx', 'shadowrocket'].includes(normalizedTarget)
         ) {
             return false;
         }
@@ -354,22 +542,33 @@ function produce(proxies, targetPlatform, type, opts = {}) {
             proxy.name = `${proxy.type} ${proxy.server}:${proxy.port}`;
         }
         if (proxy['disable-sni']) {
-            if (sni_off_supported) {
+            if (
+                ['surge', 'surgemac', 'shadowrocket'].includes(normalizedTarget)
+            ) {
                 proxy.sni = 'off';
-            } else if (!['tuic'].includes(proxy.type)) {
+            } else if (
+                !['tuic'].includes(proxy.type) &&
+                !['sing-box', 'singbox'].includes(normalizedTarget)
+            ) {
+                // 目前 Sub-Store 里 sing-box 是靠 mihomo 转一次的. 会用到 disable-sni 转成 disable_sni. 是支持的
+                // 其他客户端行为可能不一致. mihomo 可设置为 ip, 此时会不发 sni
                 $.error(
-                    `Target platform ${targetPlatform} does not support sni off. Proxy's fields (sni, tls-fingerprint and skip-cert-verify) will be modified.`,
+                    `Target platform ${targetPlatform} does not support sni off. As a workaround for mihomo, proxy ${proxy.name} sni will be set to IP instead`,
                 );
-                proxy.sni = '';
-                proxy['skip-cert-verify'] = true;
-                delete proxy['tls-fingerprint'];
+                proxy.sni = isIP(proxy.server) ? proxy.server : '127.0.0.1';
+                // proxy['skip-cert-verify'] = true;
+                // delete proxy['tls-fingerprint'];
             }
         }
 
         // 处理 端口跳跃
         if (proxy.ports) {
             proxy.ports = String(proxy.ports);
-            if (!['ClashMeta'].includes(targetPlatform)) {
+            if (
+                !['meta', 'clashmeta', 'clash.meta', 'mihomo'].includes(
+                    normalizedTarget,
+                )
+            ) {
                 proxy.ports = proxy.ports.replace(/\//g, ',');
             }
             if (!proxy.port) {
@@ -411,6 +610,7 @@ function produce(proxies, targetPlatform, type, opts = {}) {
                             Base64.encode(
                                 JSON.stringify({
                                     ...opts._merged.config,
+                                    ...(opts._merged.configOverride || {}),
                                     'mixed-port': opts.localPort,
                                 }),
                             ),
@@ -439,10 +639,68 @@ ${list}`;
     }
 }
 
+function hasRootProxyHeaders(proxy) {
+    return (
+        proxy?.headers &&
+        typeof proxy.headers === 'object' &&
+        Object.keys(proxy.headers).length > 0
+    );
+}
+
+function isRootHeaderSensitiveProxy(proxy) {
+    return ['http', 'h2-connect', 'trusttunnel'].includes(proxy?.type);
+}
+
+function supportsRootProxyHeaders(proxy, targetPlatform) {
+    const normalizedTarget = `${targetPlatform}`.toLowerCase();
+
+    if (normalizedTarget.startsWith('surge')) {
+        return ['http', 'h2-connect', 'trusttunnel'].includes(proxy.type);
+    }
+
+    if (normalizedTarget === 'egern') {
+        return proxy.type === 'http';
+    }
+
+    if (
+        ['clashmeta', 'clash.meta', 'meta', 'mihomo'].includes(normalizedTarget)
+    ) {
+        return proxy.type === 'http';
+    }
+
+    if (['singbox', 'sing-box'].includes(normalizedTarget)) {
+        return proxy.type === 'http';
+    }
+
+    if (normalizedTarget === 'json') {
+        return ['http', 'h2-connect', 'trusttunnel'].includes(proxy.type);
+    }
+
+    return false;
+}
+
+function getRootHeaderProxyLabel(proxy) {
+    if (proxy.type === 'http') {
+        return proxy.tls ? 'HTTPS' : 'HTTP';
+    }
+
+    if (proxy.type === 'h2-connect') {
+        return 'HTTP/2 CONNECT';
+    }
+
+    if (proxy.type === 'trusttunnel') {
+        return 'TrustTunnel';
+    }
+
+    return proxy.type;
+}
+
 export const ProxyUtils = {
     parse,
     process: processFn,
+    processResponse: processResponseFn,
     produce,
+    age: ageUtils,
     ipAddress,
     getRandomPort,
     isIPv4,
@@ -496,6 +754,36 @@ function formatTransportPath(path) {
 }
 
 function lastParse(proxy) {
+    // normalize keys to lowercase for all -opts keys and their subkeys
+    // 通常来说够用了, 在重构之前暂不考虑引入更复杂的逻辑
+    const hasOwn = (value, key) =>
+        Object.prototype.hasOwnProperty.call(value, key);
+    const normalizeOpts = (value) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+        for (const key of Object.keys(value)) {
+            const normalizedKey = key.toLowerCase();
+            if (key !== normalizedKey) {
+                if (!hasOwn(value, normalizedKey)) {
+                    value[normalizedKey] = value[key];
+                }
+                delete value[key];
+            }
+        }
+    };
+    for (const key of Object.keys(proxy)) {
+        const normalizedKey = key.toLowerCase();
+        if (!normalizedKey.endsWith('-opts')) continue;
+        if (key !== normalizedKey) {
+            if (!hasOwn(proxy, normalizedKey)) {
+                proxy[normalizedKey] = proxy[key];
+            }
+            delete proxy[key];
+        }
+        normalizeOpts(proxy[normalizedKey]);
+    }
+    proxy.udp = ![false, 0, '0', 'false', 'off'].includes(
+        typeof proxy.udp === 'string' ? proxy.udp.toLowerCase() : proxy.udp,
+    );
     if (typeof proxy.cipher === 'string') {
         proxy.cipher = proxy.cipher.toLowerCase();
     }
@@ -555,6 +843,64 @@ function lastParse(proxy) {
             .replace(/^\[/, '')
             .replace(/\]$/, '');
     }
+    if (
+        ['vmess', 'vless', 'trojan', 'anytls'].includes(proxy.type) &&
+        proxy['shadow-tls-opts']
+    ) {
+        proxy.plugin = 'shadow-tls';
+        proxy['plugin-opts'] = {
+            host: proxy.sni,
+            password: proxy['shadow-tls-opts'].password,
+            version: proxy['shadow-tls-opts'].version,
+        };
+        delete proxy['shadow-tls-opts'];
+    }
+    if (
+        proxy.type === 'snell' &&
+        proxy['obfs-opts']?.mode === 'shadow-tls' &&
+        !proxy.plugin
+    ) {
+        proxy.plugin = 'shadow-tls';
+        proxy['plugin-opts'] = {
+            host: proxy['obfs-opts'].host,
+            password: proxy['obfs-opts'].password,
+            version: proxy['obfs-opts'].version,
+            alpn: proxy['obfs-opts'].alpn,
+        };
+        delete proxy['obfs-opts'];
+    }
+    if (proxy.plugin === 'shadow-tls' && proxy['plugin-opts']) {
+        if (proxy.alpn && !proxy['plugin-opts'].alpn) {
+            proxy['plugin-opts'].alpn = proxy.alpn;
+        }
+        delete proxy.alpn;
+    }
+    const xhttpDownloadSettings =
+        proxy.type === 'vless' && proxy.network === 'xhttp'
+            ? proxy['xhttp-opts']?.['download-settings']
+            : undefined;
+    if (xhttpDownloadSettings?.['shadow-tls-opts']) {
+        xhttpDownloadSettings.plugin = 'shadow-tls';
+        xhttpDownloadSettings['plugin-opts'] = {
+            host: xhttpDownloadSettings.servername,
+            password: xhttpDownloadSettings['shadow-tls-opts'].password,
+            version: xhttpDownloadSettings['shadow-tls-opts'].version,
+        };
+        delete xhttpDownloadSettings['shadow-tls-opts'];
+    }
+    if (
+        xhttpDownloadSettings?.plugin === 'shadow-tls' &&
+        xhttpDownloadSettings['plugin-opts']
+    ) {
+        if (
+            xhttpDownloadSettings.alpn &&
+            !xhttpDownloadSettings['plugin-opts'].alpn
+        ) {
+            xhttpDownloadSettings['plugin-opts'].alpn =
+                xhttpDownloadSettings.alpn;
+        }
+        delete xhttpDownloadSettings.alpn;
+    }
     if (proxy.network === 'ws') {
         if (!proxy['ws-opts'] && (proxy['ws-path'] || proxy['ws-headers'])) {
             proxy['ws-opts'] = {};
@@ -601,6 +947,16 @@ function lastParse(proxy) {
         proxy.network = proxy.network || 'tcp';
     }
     if (
+        ['vmess', 'vless'].includes(proxy.type) &&
+        proxy['packet-encoding'] == null
+    ) {
+        if (proxy.xudp) {
+            proxy['packet-encoding'] = 'xudp';
+        } else if (proxy['packet-addr']) {
+            proxy['packet-encoding'] = 'packetaddr';
+        }
+    }
+    if (
         [
             'trojan',
             'tuic',
@@ -609,7 +965,10 @@ function lastParse(proxy) {
             'juicity',
             'anytls',
             'trusttunnel',
+            'h2-connect',
             'naive',
+            'masque',
+            'shadowquic',
         ].includes(proxy.type)
     ) {
         proxy.tls = true;
@@ -617,24 +976,28 @@ function lastParse(proxy) {
     if (proxy.network) {
         let transportHost = proxy[`${proxy.network}-opts`]?.headers?.Host;
         let transporthost = proxy[`${proxy.network}-opts`]?.headers?.host;
-        if (proxy.network === 'h2') {
-            if (!transporthost && transportHost) {
-                proxy[`${proxy.network}-opts`].headers.host = transportHost;
-                delete proxy[`${proxy.network}-opts`].headers.Host;
-            }
-        } else if (transporthost && !transportHost) {
+        if (proxy.network !== 'h2' && transporthost && !transportHost) {
             proxy[`${proxy.network}-opts`].headers.Host = transporthost;
             delete proxy[`${proxy.network}-opts`].headers.host;
         }
     }
     if (proxy.network === 'h2') {
-        const host = proxy['h2-opts']?.headers?.host;
-        const path = proxy['h2-opts']?.path;
-        if (host && !Array.isArray(host)) {
-            proxy['h2-opts'].headers.host = [host];
+        const h2Opts = proxy['h2-opts'];
+        const host =
+            h2Opts?.host ?? h2Opts?.headers?.host ?? h2Opts?.headers?.Host;
+        const path = h2Opts?.path;
+        if (host) {
+            h2Opts.host = Array.isArray(host) ? host : [host];
+        }
+        if (h2Opts?.headers) {
+            delete h2Opts.headers.host;
+            delete h2Opts.headers.Host;
+            if (Object.keys(h2Opts.headers).length === 0) {
+                delete h2Opts.headers;
+            }
         }
         if (Array.isArray(path)) {
-            proxy['h2-opts'].path = path[0];
+            h2Opts.path = path[0];
         }
     }
 
@@ -670,7 +1033,10 @@ function lastParse(proxy) {
     if (proxy.tls && !proxy.sni && proxy.sni !== '') {
         // 传输层若有设置就使用
         if (proxy.network) {
-            let transportHost = proxy[`${proxy.network}-opts`]?.headers?.Host;
+            let transportHost =
+                proxy.network === 'h2'
+                    ? proxy['h2-opts']?.host
+                    : proxy[`${proxy.network}-opts`]?.headers?.Host;
             transportHost = Array.isArray(transportHost)
                 ? transportHost[0]
                 : transportHost;
@@ -756,7 +1122,10 @@ function lastParse(proxy) {
             }
         }
     }
-    if (['ws', 'http', 'h2'].includes(proxy.network)) {
+    if (
+        ['ws', 'http', 'h2'].includes(proxy.network) &&
+        !['masque'].includes(proxy.type)
+    ) {
         if (
             ['ws', 'h2'].includes(proxy.network) &&
             !proxy[`${proxy.network}-opts`]?.path
@@ -773,6 +1142,9 @@ function lastParse(proxy) {
                 proxy[`${proxy.network}-opts`] || {};
             proxy[`${proxy.network}-opts`].path = ['/'];
         }
+    }
+    if (['anytls'].includes(proxy.type) && proxy['disable-reuse']) {
+        proxy.reuse = false;
     }
     if (['', 'off'].includes(proxy.sni)) {
         proxy['disable-sni'] = true;
@@ -795,20 +1167,6 @@ function lastParse(proxy) {
     }
     if (!proxy['tls-fingerprint'] && caStr) {
         proxy['tls-fingerprint'] = rs.generateFingerprint(caStr);
-    }
-    if (
-        ['ss'].includes(proxy.type) &&
-        isPresent(proxy, 'shadow-tls-password')
-    ) {
-        proxy.plugin = 'shadow-tls';
-        proxy['plugin-opts'] = {
-            host: proxy['shadow-tls-sni'],
-            password: proxy['shadow-tls-password'],
-            version: proxy['shadow-tls-version'],
-        };
-        delete proxy['shadow-tls-sni'];
-        delete proxy['shadow-tls-password'];
-        delete proxy['shadow-tls-version'];
     }
     if (['tuic'].includes(proxy.type)) {
         proxy.alpn = Array.isArray(proxy.alpn)

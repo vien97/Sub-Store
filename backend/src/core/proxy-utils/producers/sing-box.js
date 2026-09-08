@@ -5,7 +5,9 @@ import { getWireGuardAddressWithCIDR, normalizePluginMuxValue } from './utils';
 import {
     extractPathQueryParam,
     getSafeIntegerPathQueryParam,
+    parseSafeIntegerValue,
 } from '../transport-path';
+import { normalizeVmessSecurity } from '../vmess-security';
 
 const ipVersions = {
     ipv4: 'ipv4_only',
@@ -28,19 +30,44 @@ const ipVersionParser = (proxy, parsedProxy) => {
     }
 };
 const domainResolverParser = (proxy, parsedProxy) => {
-    if (proxy._domain_resolver) {
+    if (!proxy._domain_resolver) {
+        return;
+    }
+
+    if (typeof proxy._domain_resolver === 'string') {
         parsedProxy.domain_resolver = {
-            ...parsedProxy.domain_resolver,
+            ...(parsedProxy.domain_resolver ?? {}),
+            server: proxy._domain_resolver,
+        };
+    } else {
+        parsedProxy.domain_resolver = {
+            ...(parsedProxy.domain_resolver ?? {}),
             ...proxy._domain_resolver,
         };
     }
+};
+const hasControlHTTPClient = (proxy) => {
+    const value = proxy['control-http-client'];
+    if (value === undefined || value === null) return false;
+    if (typeof value === 'string') return value.trim() !== '';
+    if (isPlainObject(value)) {
+        return Object.values(value).some(
+            (item) => item !== undefined && item !== null && item !== '',
+        );
+    }
+    return true;
 };
 const detourParser = (proxy, parsedProxy) => {
     parsedProxy.detour = proxy['dialer-proxy'] || proxy.detour;
 };
 const networkParser = (proxy, parsedProxy) => {
-    if (['tcp', 'udp'].includes(proxy._network))
+    if (['tcp', 'udp'].includes(proxy._network)) {
         parsedProxy.network = proxy._network;
+        return;
+    }
+    if (proxy.udp === false) {
+        parsedProxy.network = 'tcp';
+    }
 };
 const tfoParser = (proxy, parsedProxy) => {
     parsedProxy.tcp_fast_open = false;
@@ -272,6 +299,24 @@ const normalizePemLines = (value, label) => {
     return [`-----BEGIN ${label}-----`, ...lines, `-----END ${label}-----`];
 };
 
+const singBoxUtlsFingerprints = [
+    'chrome',
+    'firefox',
+    'edge',
+    'safari',
+    '360',
+    'qq',
+    'ios',
+    'android',
+    'random',
+    'randomized',
+];
+
+const getSingBoxUtlsFingerprint = (value) => {
+    const fingerprint = `${value || ''}`.trim().toLowerCase();
+    if (singBoxUtlsFingerprints.includes(fingerprint)) return fingerprint;
+};
+
 const tlsParser = (proxy, parsedProxy) => {
     if (proxy.tls) parsedProxy.tls.enabled = true;
     if (proxy.servername && proxy.servername !== '')
@@ -302,11 +347,17 @@ const tlsParser = (proxy, parsedProxy) => {
         !['hysteria', 'hysteria2', 'tuic'].includes(proxy.type) &&
         proxy['client-fingerprint'] &&
         proxy['client-fingerprint'] !== ''
-    )
-        parsedProxy.tls.utls = {
-            enabled: true,
-            fingerprint: proxy['client-fingerprint'],
-        };
+    ) {
+        const fingerprint = getSingBoxUtlsFingerprint(
+            proxy['client-fingerprint'],
+        );
+        if (fingerprint)
+            parsedProxy.tls.utls = {
+                ...parsedProxy.tls.utls,
+                enabled: true,
+                fingerprint,
+            };
+    }
     if (proxy._ech && isPlainObject(proxy._ech)) {
         parsedProxy.tls.ech = proxy._ech;
     } else if (proxy['ech-opts'] && isPlainObject(proxy['ech-opts'])) {
@@ -350,7 +401,21 @@ const tlsParser = (proxy, parsedProxy) => {
     if (proxy['_client_key']) parsedProxy.tls.client_key = proxy['_client_key'];
     if (proxy['_client_key_path'])
         parsedProxy.tls.client_key_path = proxy['_client_key_path'];
-    if (!parsedProxy.tls.enabled) delete parsedProxy.tls;
+    if (!parsedProxy.tls.enabled) {
+        delete parsedProxy.tls;
+    } else if (
+        (proxy.fingerprint || proxy['tls-fingerprint']) &&
+        !parsedProxy.tls.reality &&
+        !parsedProxy.tls.certificate &&
+        !parsedProxy.tls.certificate_path &&
+        !parsedProxy.tls.certificate_public_key_sha256
+    ) {
+        // sing-box can only pin the SHA-256 of the certificate public key
+        // https://sing-box.sagernet.org/configuration/shared/tls/#certificate_public_key_sha256
+        $.warn(
+            `Platform sing-box does not support certificate fingerprint pinning, it is dropped for proxy ${proxy.name}. Set _certificate_public_key_sha256 to pin the certificate public key instead`,
+        );
+    }
 };
 
 const sshParser = (proxy = {}) => {
@@ -453,12 +518,13 @@ const socks5Parser = (proxy = {}) => {
 };
 
 const shadowTLSParser = (proxy = {}) => {
+    const pluginOpts = getShadowTLSPluginOpts(proxy);
     const ssPart = {
         tag: proxy.name,
         type: 'shadowsocks',
         method: proxy.cipher,
         password: proxy.password,
-        detour: `${proxy.name}_shadowtls`,
+        detour: getShadowTLSTag(proxy),
     };
     if (proxy.uot) ssPart.udp_over_tcp = true;
     if (proxy['udp-over-tcp']) {
@@ -471,32 +537,78 @@ const shadowTLSParser = (proxy = {}) => {
                     : 2,
         };
     }
+    networkParser(proxy, ssPart);
+    smuxParser(proxy.smux, ssPart);
+    return {
+        type: 'ss-with-st',
+        ssPart,
+        stPart: shadowTLSOutboundParser(proxy, pluginOpts),
+    };
+};
+
+const getShadowTLSTag = (proxy = {}) => `${proxy.name}_shadowtls`;
+
+const getShadowTLSPluginOpts = (proxy = {}) => {
+    if (proxy.plugin === 'shadow-tls' && proxy['plugin-opts']) {
+        return proxy['plugin-opts'];
+    }
+    if (proxy.type === 'snell' && proxy['obfs-opts']?.mode === 'shadow-tls') {
+        return {
+            host: proxy['obfs-opts'].host,
+            password: proxy['obfs-opts'].password,
+            version: proxy['obfs-opts'].version,
+            alpn: proxy['obfs-opts'].alpn,
+        };
+    }
+    return undefined;
+};
+
+const normalizeALPN = (alpn) => {
+    if (typeof alpn === 'string') {
+        return alpn
+            .split(',')
+            .map((item) => item.trim())
+            .filter((item) => item !== '');
+    }
+    if (Array.isArray(alpn)) return alpn;
+    return undefined;
+};
+
+const shadowTLSOutboundParser = (proxy = {}, pluginOpts) => {
+    if (!pluginOpts) throw new Error('shadow-tls plugin options are missing');
+    const fingerprint = getSingBoxUtlsFingerprint(proxy['client-fingerprint']);
+
     const stPart = {
-        tag: `${proxy.name}_shadowtls`,
+        tag: getShadowTLSTag(proxy),
         type: 'shadowtls',
         server: proxy.server,
         server_port: parseInt(`${proxy.port}`, 10),
-        version: proxy['plugin-opts'].version,
-        password: proxy['plugin-opts'].password,
+        version: pluginOpts.version,
+        password: pluginOpts.password,
         tls: {
             enabled: true,
-            server_name: proxy['plugin-opts'].host,
-            utls: {
-                enabled: true,
-                fingerprint: proxy['client-fingerprint'],
-            },
+            server_name: pluginOpts.host,
         },
     };
+    if (proxy['skip-cert-verify']) stPart.tls.insecure = true;
+    if (fingerprint) {
+        stPart.tls.utls = {
+            enabled: true,
+            fingerprint,
+        };
+    }
     if (stPart.server_port < 0 || stPart.server_port > 65535)
         throw '端口值非法';
+    const alpn = normalizeALPN(pluginOpts.alpn) ?? normalizeALPN(proxy.alpn);
+    if (alpn) stPart.tls.alpn = alpn;
     if (proxy['fast-open'] === true) stPart.udp_fragment = true;
     tfoParser(proxy, stPart);
     detourParser(proxy, stPart);
-    smuxParser(proxy.smux, ssPart);
     ipVersionParser(proxy, stPart);
     domainResolverParser(proxy, stPart);
-    return { type: 'ss-with-st', ssPart, stPart };
+    return stPart;
 };
+
 const ssParser = (proxy = {}) => {
     const parsedProxy = {
         tag: proxy.name,
@@ -605,12 +717,115 @@ const ssrParser = (proxy = {}) => {
     if (proxy['protocol-param'] && proxy['protocol-param'] !== '')
         parsedProxy.protocol_param = proxy['protocol-param'];
     if (proxy['fast-open']) parsedProxy.udp_fragment = true;
+    networkParser(proxy, parsedProxy);
     tfoParser(proxy, parsedProxy);
     detourParser(proxy, parsedProxy);
     smuxParser(proxy.smux, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
     domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
+};
+
+const getSnellVersion = (version) => {
+    if (version == null) return undefined;
+    const normalized = `${version}`.trim();
+    if (!/^\d+$/.test(normalized)) return NaN;
+    return parseInt(normalized, 10);
+};
+
+const snellParser = (proxy = {}, includeUnsupportedProxy = false) => {
+    const version = getSnellVersion(proxy.version);
+    const shadowTLSPluginOpts = getShadowTLSPluginOpts(proxy);
+    const supportedVersions = includeUnsupportedProxy
+        ? [1, 2, 3, 4, 5, 6]
+        : [4, 5, 6];
+    if (
+        version != null &&
+        (!supportedVersions.includes(version) || Number.isNaN(version))
+    ) {
+        throw new Error(
+            `Platform sing-box does not support snell version ${proxy.version}`,
+        );
+    }
+    const outputVersion =
+        !includeUnsupportedProxy && version === 5 ? 4 : version;
+
+    const parsedProxy = {
+        tag: proxy.name,
+        type: 'snell',
+        server: proxy.server,
+        server_port: parseInt(`${proxy.port}`, 10),
+        psk: proxy.psk,
+    };
+    if (parsedProxy.server_port < 0 || parsedProxy.server_port > 65535)
+        throw 'invalid port';
+    if (outputVersion != null) parsedProxy.version = outputVersion;
+    if (proxy._userkey) parsedProxy.userkey = proxy._userkey;
+    if (outputVersion === 6) {
+        if (proxy.mode) parsedProxy.mode = proxy.mode;
+        if (includeUnsupportedProxy && proxy['quic-proxy-mode'])
+            parsedProxy.quic_proxy_mode = !!proxy['quic-proxy-mode'];
+    } else {
+        if (
+            proxy['obfs-opts']?.mode &&
+            proxy['obfs-opts'].mode !== 'shadow-tls'
+        )
+            parsedProxy.obfs_mode = proxy['obfs-opts'].mode;
+        if (
+            proxy['obfs-opts']?.host &&
+            proxy['obfs-opts']?.mode !== 'shadow-tls'
+        )
+            parsedProxy.obfs_host = proxy['obfs-opts'].host;
+    }
+    if (proxy.reuse && (version == null || version >= 4))
+        parsedProxy.reuse = true;
+    networkParser(proxy, parsedProxy);
+    if (shadowTLSPluginOpts) {
+        parsedProxy.detour = getShadowTLSTag(proxy);
+        delete parsedProxy.server;
+        delete parsedProxy.server_port;
+    } else {
+        if (proxy['fast-open']) parsedProxy.udp_fragment = true;
+        tfoParser(proxy, parsedProxy);
+        detourParser(proxy, parsedProxy);
+        ipVersionParser(proxy, parsedProxy);
+        domainResolverParser(proxy, parsedProxy);
+    }
+    return parsedProxy;
+};
+
+const singBoxPacketEncodings = ['', 'packetaddr', 'xudp'];
+
+const normalizeSingBoxPacketEncoding = (value) => {
+    const packetEncoding = `${value}`.trim().toLowerCase();
+    if (singBoxPacketEncodings.includes(packetEncoding)) {
+        return packetEncoding;
+    }
+    return undefined;
+};
+
+const vmessVlessPacketEncodingParser = (proxy, parsedProxy) => {
+    if (proxy['packet-encoding'] != null) {
+        const packetEncoding = normalizeSingBoxPacketEncoding(
+            proxy['packet-encoding'],
+        );
+        if (packetEncoding != null)
+            parsedProxy.packet_encoding = packetEncoding;
+    } else if (proxy.xudp) {
+        parsedProxy.packet_encoding = 'xudp';
+    } else if (proxy['packet-addr']) {
+        parsedProxy.packet_encoding = 'packetaddr';
+    }
+};
+
+const vmessProtocolOptionsParser = (proxy, parsedProxy) => {
+    vmessVlessPacketEncodingParser(proxy, parsedProxy);
+    if (proxy['global-padding'] != null) {
+        parsedProxy.global_padding = !!proxy['global-padding'];
+    }
+    if (proxy['authenticated-length'] != null) {
+        parsedProxy.authenticated_length = !!proxy['authenticated-length'];
+    }
 };
 
 const vmessParser = (proxy = {}) => {
@@ -620,24 +835,13 @@ const vmessParser = (proxy = {}) => {
         server: proxy.server,
         server_port: parseInt(`${proxy.port}`, 10),
         uuid: proxy.uuid,
-        security: proxy.cipher,
+        security: normalizeVmessSecurity(proxy.cipher),
         alter_id: parseInt(`${proxy.alterId}`, 10),
         tls: { enabled: false, server_name: proxy.server, insecure: false },
     };
-    if (
-        [
-            'auto',
-            'none',
-            'zero',
-            'aes-128-gcm',
-            'chacha20-poly1305',
-            'aes-128-ctr',
-        ].indexOf(parsedProxy.security) === -1
-    )
-        parsedProxy.security = 'auto';
     if (parsedProxy.server_port < 0 || parsedProxy.server_port > 65535)
         throw 'invalid port';
-    if (proxy.xudp) parsedProxy.packet_encoding = 'xudp';
+    vmessProtocolOptionsParser(proxy, parsedProxy);
     if (proxy['fast-open']) parsedProxy.udp_fragment = true;
     if (proxy.network === 'ws') wsParser(proxy, parsedProxy);
     if (proxy.network === 'h2') h2Parser(proxy, parsedProxy);
@@ -664,7 +868,7 @@ const vlessParser = (proxy = {}) => {
     };
     if (parsedProxy.server_port < 0 || parsedProxy.server_port > 65535)
         throw 'invalid port';
-    if (proxy.xudp) parsedProxy.packet_encoding = 'xudp';
+    vmessVlessPacketEncodingParser(proxy, parsedProxy);
     if (proxy['fast-open']) parsedProxy.udp_fragment = true;
     // if (['xtls-rprx-vision', ''].includes(proxy.flow)) parsedProxy.flow = proxy.flow;
     if (proxy.flow != null) parsedProxy.flow = proxy.flow;
@@ -814,6 +1018,7 @@ const hysteriaParser = (proxy = {}) => {
     domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
+
 const hysteria2Parser = (proxy = {}) => {
     const parsedProxy = {
         tag: proxy.name,
@@ -837,10 +1042,56 @@ const hysteria2Parser = (proxy = {}) => {
         });
     if (proxy.up) parsedProxy.up_mbps = parseInt(`${proxy.up}`, 10);
     if (proxy.down) parsedProxy.down_mbps = parseInt(`${proxy.down}`, 10);
-    if (proxy.obfs === 'salamander') parsedProxy.obfs.type = 'salamander';
+    if (['salamander', 'gecko'].includes(proxy.obfs))
+        parsedProxy.obfs.type = proxy.obfs;
+    if (proxy.obfs === 'gecko') {
+        const minRaw = proxy['obfs-min-packet-size'];
+        const maxRaw = proxy['obfs-max-packet-size'];
+        const hasMin =
+            minRaw !== undefined && minRaw !== null && `${minRaw}` !== '';
+        const hasMax =
+            maxRaw !== undefined && maxRaw !== null && `${maxRaw}` !== '';
+        if (hasMin || hasMax) {
+            const minPacketSize = hasMin
+                ? parseSafeIntegerValue(`${minRaw}`.trim())
+                : undefined;
+            const rawMaxPacketSize = hasMax
+                ? parseSafeIntegerValue(`${maxRaw}`.trim())
+                : undefined;
+            const maxPacketSize =
+                rawMaxPacketSize != null
+                    ? Math.min(rawMaxPacketSize, 2048)
+                    : rawMaxPacketSize;
+            const effectiveMinPacketSize = minPacketSize ?? 512;
+            const effectiveMaxPacketSize = maxPacketSize ?? 1200;
+
+            if (hasMax && rawMaxPacketSize != null && rawMaxPacketSize > 2048) {
+                $.warn(
+                    `Gecko obfs max packet size for proxy ${proxy.name} exceeds 2048, clamped to 2048: ${maxRaw}`,
+                );
+            }
+
+            if (
+                (hasMin && (minPacketSize == null || minPacketSize <= 0)) ||
+                (hasMax &&
+                    (rawMaxPacketSize == null || rawMaxPacketSize <= 0)) ||
+                effectiveMaxPacketSize < effectiveMinPacketSize
+            ) {
+                $.error(
+                    `Invalid obfs packet size for proxy ${proxy.name}: min=${minRaw} max=${maxRaw}`,
+                );
+            } else {
+                if (hasMin) parsedProxy.obfs.min_packet_size = minPacketSize;
+                if (hasMax) parsedProxy.obfs.max_packet_size = maxPacketSize;
+            }
+        }
+    }
     if (proxy['obfs-password'])
         parsedProxy.obfs.password = proxy['obfs-password'];
     if (!parsedProxy.obfs.type) delete parsedProxy.obfs;
+    if (proxy['bbr-profile']) parsedProxy.bbr_profile = proxy['bbr-profile'];
+    if (proxy['disable-chrome-parrot'])
+        parsedProxy.disable_chrome_parrot = !!proxy['disable-chrome-parrot'];
     networkParser(proxy, parsedProxy);
     tlsParser(proxy, parsedProxy);
     tfoParser(proxy, parsedProxy);
@@ -883,7 +1134,7 @@ const tuic5Parser = (proxy = {}) => {
     domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
-const anytlsParser = (proxy = {}) => {
+const anytlsParser = (proxy = {}, includeUnsupportedProxy = false) => {
     const parsedProxy = {
         tag: proxy.name,
         type: 'anytls',
@@ -892,6 +1143,8 @@ const anytlsParser = (proxy = {}) => {
         password: proxy.password,
         tls: { enabled: true, server_name: proxy.server, insecure: false },
     };
+    if (proxy['client-metadata'])
+        parsedProxy.client_metadata = `${proxy['client-metadata']}`;
     if (/^\d+$/.test(proxy['idle-session-check-interval']))
         parsedProxy.idle_session_check_interval = `${proxy['idle-session-check-interval']}s`;
     if (/^\d+$/.test(proxy['idle-session-timeout']))
@@ -901,7 +1154,9 @@ const anytlsParser = (proxy = {}) => {
             `${proxy['min-idle-session']}`,
             10,
         );
-    networkParser(proxy, parsedProxy);
+    if (proxy['disable-reuse'] != null) {
+        parsedProxy.disable_reuse = !!proxy['disable-reuse'];
+    }
     detourParser(proxy, parsedProxy);
     tlsParser(proxy, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
@@ -909,11 +1164,13 @@ const anytlsParser = (proxy = {}) => {
     return parsedProxy;
 };
 const tailscaleParser = (proxy = {}) => {
+    const useControlHTTPClient = hasControlHTTPClient(proxy);
     const parsedProxy = {
         tag: proxy.name,
         type: 'tailscale',
+        control_http_client: proxy['control-http-client'],
         udp_timeout: proxy['udp-timeout'],
-        state_directory: proxy['state-directory'],
+        state_directory: proxy['state-dir'] || proxy['state-directory'],
         auth_key: proxy['auth-key'],
         control_url: proxy['control-url'],
         ephemeral: proxy.ephemeral,
@@ -946,10 +1203,21 @@ const tailscaleParser = (proxy = {}) => {
             `${proxy['relay-server-port']}`,
             10,
         );
-    networkParser(proxy, parsedProxy);
-    detourParser(proxy, parsedProxy);
-    ipVersionParser(proxy, parsedProxy);
-    domainResolverParser(proxy, parsedProxy);
+    if (!useControlHTTPClient) {
+        detourParser(proxy, parsedProxy);
+        ipVersionParser(proxy, parsedProxy);
+        domainResolverParser(proxy, parsedProxy);
+    }
+    if (isPlainObject(proxy['ssh-server'])) {
+        parsedProxy.ssh_server = {
+            enabled: proxy['ssh-server'].enabled !== false,
+            disable_pty: proxy['ssh-server']['disable-pty'],
+            disable_sftp: proxy['ssh-server']['disable-sftp'],
+            disable_forwarding: proxy['ssh-server']['disable-forwarding'],
+        };
+    } else if (proxy['ssh-server']) {
+        parsedProxy.ssh_server = !!proxy['ssh-server'];
+    }
     return parsedProxy;
 };
 
@@ -1036,7 +1304,6 @@ const wireguardParser = (proxy = {}) => {
             parsedProxy.peers.push(peer);
         }
     }
-    networkParser(proxy, parsedProxy);
     tfoParser(proxy, parsedProxy);
     detourParser(proxy, parsedProxy);
     smuxParser(proxy.smux, parsedProxy);
@@ -1054,10 +1321,100 @@ export default function singbox_Producer() {
     const type = 'ALL';
     const produce = (proxies, type, opts = {}) => {
         const list = [];
+        const originalShadowTLS = new Map(
+            proxies
+                .filter(
+                    (proxy) =>
+                        proxy?.plugin === 'shadow-tls' &&
+                        proxy?.['plugin-opts'],
+                )
+                .map((proxy) => [
+                    proxy,
+                    {
+                        plugin: proxy.plugin,
+                        'plugin-opts': proxy['plugin-opts']
+                            ? JSON.parse(JSON.stringify(proxy['plugin-opts']))
+                            : undefined,
+                        'obfs-opts': proxy['obfs-opts']
+                            ? JSON.parse(JSON.stringify(proxy['obfs-opts']))
+                            : undefined,
+                    },
+                ]),
+        );
         ClashMeta_Producer()
             .produce(proxies, 'internal', { 'include-unsupported-proxy': true })
             .map((proxy) => {
+                const listStart = list.length;
                 try {
+                    const shadowTLS = originalShadowTLS.get(proxy);
+                    if (shadowTLS) {
+                        proxy.plugin = shadowTLS.plugin;
+                        proxy['plugin-opts'] = shadowTLS['plugin-opts'];
+                        if (shadowTLS['obfs-opts']) {
+                            proxy['obfs-opts'] = shadowTLS['obfs-opts'];
+                        } else {
+                            delete proxy['obfs-opts'];
+                        }
+                    }
+                    const shadowTLSPluginOpts = getShadowTLSPluginOpts(proxy);
+                    const shadowTLSEnabled = Boolean(
+                        shadowTLSPluginOpts &&
+                            (shadowTLSPluginOpts.password ||
+                                (shadowTLSPluginOpts.version != null &&
+                                    Number(shadowTLSPluginOpts.version) !== 0)),
+                    );
+                    let streamShadowTLSOutbound;
+                    if (
+                        shadowTLSEnabled &&
+                        ['vmess', 'vless', 'trojan'].includes(proxy.type)
+                    ) {
+                        if (proxy['reality-opts']) {
+                            throw new Error(
+                                `Platform sing-box cannot chain ShadowTLS with Reality for proxy ${proxy.name}`,
+                            );
+                        }
+                        if (
+                            ['vmess', 'vless'].includes(proxy.type) &&
+                            proxy.network === 'h2'
+                        ) {
+                            throw new Error(
+                                `Platform sing-box cannot chain ShadowTLS with network h2 for proxy ${proxy.name}`,
+                            );
+                        }
+                        if (
+                            proxy.type === 'vless' &&
+                            proxy.flow === 'xtls-rprx-vision'
+                        ) {
+                            throw new Error(
+                                `Platform sing-box cannot chain ShadowTLS with flow xtls-rprx-vision for proxy ${proxy.name}`,
+                            );
+                        }
+
+                        const rawVersion = shadowTLSPluginOpts.version;
+                        const parsedVersion =
+                            typeof rawVersion === 'string' &&
+                            rawVersion.trim() === ''
+                                ? NaN
+                                : Number(rawVersion ?? 0);
+                        const version = parsedVersion === 0 ? 2 : parsedVersion;
+                        if (
+                            !Number.isInteger(version) ||
+                            ![1, 2, 3].includes(version)
+                        ) {
+                            throw new Error(
+                                `Platform sing-box does not support shadow-tls version ${rawVersion} for proxy ${proxy.name}`,
+                            );
+                        }
+                        streamShadowTLSOutbound = shadowTLSOutboundParser(
+                            proxy,
+                            { ...shadowTLSPluginOpts, version },
+                        );
+                    }
+                    if (proxy.type === 'anytls' && shadowTLSEnabled) {
+                        throw new Error(
+                            'Platform sing-box cannot replace AnyTLS TLS with ShadowTLS',
+                        );
+                    }
                     if (['xhttp'].includes(proxy.network))
                         throw new Error(
                             `Platform sing-box does not support network: ${proxy.network}`,
@@ -1126,6 +1483,25 @@ export default function singbox_Producer() {
                                 );
                             }
                             break;
+                        case 'snell': {
+                            list.push(
+                                snellParser(
+                                    proxy,
+                                    opts['include-unsupported-proxy'],
+                                ),
+                            );
+                            const shadowTLSPluginOpts =
+                                getShadowTLSPluginOpts(proxy);
+                            if (shadowTLSPluginOpts) {
+                                list.push(
+                                    shadowTLSOutboundParser(
+                                        proxy,
+                                        shadowTLSPluginOpts,
+                                    ),
+                                );
+                            }
+                            break;
+                        }
                         case 'vmess':
                             if (
                                 !proxy.network ||
@@ -1196,7 +1572,12 @@ export default function singbox_Producer() {
                             list.push(wireguardParser(proxy));
                             break;
                         case 'anytls':
-                            list.push(anytlsParser(proxy));
+                            list.push(
+                                anytlsParser(
+                                    proxy,
+                                    opts['include-unsupported-proxy'],
+                                ),
+                            );
                             break;
                         case 'tailscale':
                             list.push(tailscaleParser(proxy));
@@ -1206,8 +1587,26 @@ export default function singbox_Producer() {
                                 `Platform sing-box does not support proxy type: ${proxy.type}`,
                             );
                     }
+                    if (streamShadowTLSOutbound) {
+                        const outbound = list[listStart];
+                        outbound.detour = getShadowTLSTag(proxy);
+                        delete outbound.tls;
+                        list.push(streamShadowTLSOutbound);
+                    }
+                    if (
+                        opts['include-unsupported-proxy'] &&
+                        proxy['name-cert-verify']
+                    ) {
+                        for (let i = listStart; i < list.length; i++) {
+                            const outbound = list[i];
+                            if (outbound.tls)
+                                outbound.tls.certificate_server_name =
+                                    proxy['name-cert-verify'];
+                        }
+                    }
                 } catch (e) {
                     // console.log(e);
+                    list.length = listStart;
                     $.error(e.message ?? e);
                 }
             });

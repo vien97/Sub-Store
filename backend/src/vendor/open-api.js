@@ -1,15 +1,18 @@
 /* eslint-disable no-undef */
 import { installConsoleLogCapture } from '@/utils/debug-logs';
+import getChildProcess from '@/runtime/child-process';
+import getFs from '@/runtime/fs';
 
 const isQX = typeof $task !== 'undefined';
 const isLoon = typeof $loon !== 'undefined';
+const isEgern = 'undefined' !== typeof Egern;
 // 可能有一些兼容环境依赖于这个, 先不改成 $environment.surge-version
-const isSurge = typeof $httpClient !== 'undefined' && !isLoon;
+const isSurge = typeof $httpClient !== 'undefined' && !isLoon && !isEgern;
 const isNode = eval(`typeof process !== "undefined"`); // eval is needed in order to avoid browserify processing
 const isStash =
     'undefined' !== typeof $environment && $environment['stash-version'];
 const isShadowRocket = 'undefined' !== typeof $rocket;
-const isEgern = 'undefined' !== typeof Egern && Egern.version;
+
 const isLanceX = 'undefined' != typeof $native;
 const isGUIforCores = typeof $Plugins !== 'undefined';
 import { Base64 } from 'js-base64';
@@ -42,6 +45,27 @@ function parseSocks5Uri(uri) {
         password: password != null ? decodeURIComponent(password) : undefined,
     };
 }
+
+function normalizeNodeRequestHeaders(headers) {
+    const normalized = [];
+    let hasAccept = false;
+
+    for (const [key, value] of Object.entries(headers || {})) {
+        const normalizedKey = key.toLowerCase();
+        if (normalizedKey === 'accept') {
+            hasAccept = true;
+            if (value == null) continue;
+        }
+        normalized.push([normalizedKey, value]);
+    }
+
+    if (!hasAccept) {
+        normalized.push(['accept', '*/*']);
+    }
+
+    return Object.fromEntries(normalized);
+}
+
 export class OpenAPI {
     constructor(name = 'untitled', debug = false) {
         this.name = name;
@@ -56,7 +80,7 @@ export class OpenAPI {
         }
         this.node = (() => {
             if (isNode) {
-                const fs = eval("require('fs')");
+                const fs = getFs();
 
                 return {
                     fs,
@@ -84,7 +108,7 @@ export class OpenAPI {
     initCache() {
         if (isQX)
             this.cache = JSON.parse($prefs.valueForKey(this.name) || '{}');
-        if (isLoon || isSurge)
+        if (isLoon || isSurge || isEgern)
             this.cache = JSON.parse($persistentStore.read(this.name) || '{}');
         if (isGUIforCores)
             this.cache = JSON.parse(
@@ -161,7 +185,8 @@ export class OpenAPI {
     persistCache() {
         const data = JSON.stringify(this.cache, null, 2);
         if (isQX) $prefs.setValueForKey(data, this.name);
-        if (isLoon || isSurge) $persistentStore.write(data, this.name);
+        if (isLoon || isSurge || isEgern)
+            $persistentStore.write(data, this.name);
         if (isGUIforCores) $Plugins.SubStoreCache.set(this.name, data);
         if (isNode) {
             const basePath =
@@ -186,7 +211,7 @@ export class OpenAPI {
         this.log(`SET ${key}`);
         if (key.indexOf('#') !== -1) {
             key = key.substr(1);
-            if (isSurge || isLoon) {
+            if (isSurge || isLoon || isEgern) {
                 return $persistentStore.write(data, key);
             }
             if (isQX) {
@@ -208,7 +233,7 @@ export class OpenAPI {
         this.log(`READ ${key}`);
         if (key.indexOf('#') !== -1) {
             key = key.substr(1);
-            if (isSurge || isLoon) {
+            if (isSurge || isLoon || isEgern) {
                 return $persistentStore.read(key);
             }
             if (isQX) {
@@ -229,7 +254,7 @@ export class OpenAPI {
         this.log(`DELETE ${key}`);
         if (key.indexOf('#') !== -1) {
             key = key.substr(1);
-            if (isSurge || isLoon) {
+            if (isSurge || isLoon || isEgern) {
                 return $persistentStore.write(null, key);
             }
             if (isQX) {
@@ -253,7 +278,7 @@ export class OpenAPI {
         const mediaURL = options['media-url'];
 
         if (isQX) $notify(title, subtitle, content, options);
-        if (isSurge) {
+        if (isSurge || isEgern) {
             $notification.post(
                 title,
                 subtitle,
@@ -309,7 +334,7 @@ export class OpenAPI {
                             );
                         });
                 } else {
-                    const { execFile } = eval(`require("child_process")`);
+                    const { execFile } = getChildProcess();
                     execFile(
                         'shoutrrr',
                         [
@@ -366,7 +391,7 @@ export class OpenAPI {
     }
 
     done(value = {}) {
-        if (isQX || isLoon || isSurge || isGUIforCores) {
+        if (isQX || isLoon || isSurge || isGUIforCores || isEgern) {
             $done(value);
         } else if (isNode) {
             if (typeof $context !== 'undefined') {
@@ -393,7 +418,7 @@ export function ENV() {
 }
 
 export function HTTP(defaultOptions = { baseURL: '' }) {
-    const { isQX, isLoon, isSurge, isNode, isGUIforCores } = ENV();
+    const { isQX, isLoon, isSurge, isNode, isGUIforCores, isEgern } = ENV();
     const methods = [
         'GET',
         'POST',
@@ -406,7 +431,13 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
     const URL_REGEX =
         /https?:\/\/(www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_+.~#?&//=]*)/;
 
-    function send(method, options) {
+    let requestIdCounter = 0;
+
+    function generateRequestId() {
+        return `${Date.now()}-${++requestIdCounter}`;
+    }
+
+    async function send(method, options) {
         options = typeof options === 'string' ? { url: options } : options;
         const baseURL = defaultOptions.baseURL;
         if (baseURL && !URL_REGEX.test(options.url || '')) {
@@ -414,6 +445,7 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
         }
         options = { ...defaultOptions, ...options };
         const timeout = options.timeout;
+        const requestId = options.requestId || generateRequestId();
         const events = {
             ...{
                 onRequest: () => {},
@@ -445,28 +477,13 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
                 body: options.body,
                 opts: options.opts,
             });
-        } else if (isLoon || isSurge || isNode) {
-            worker = new Promise(async (resolve, reject) => {
+        } else if (isLoon || isSurge || isNode || isEgern) {
+            worker = new Promise((resolve, reject) => {
                 const body = options.body;
                 const opts = JSON.parse(JSON.stringify(options));
+
                 opts.body = body;
-                opts.timeout = opts.timeout || 8000;
-                if (opts.timeout) {
-                    opts.timeout++;
-                    if (isNaN(opts.timeout)) {
-                        opts.timeout = 8000;
-                    }
-                    if (!isNode) {
-                        let unit = 'ms';
-                        // 这些客户端单位为 s
-                        if (isSurge || isStash || isShadowRocket) {
-                            opts.timeout = Math.ceil(opts.timeout / 1000);
-                            unit = 's';
-                        }
-                        // Loon 为 ms
-                        // console.log(`[httpClient timeout] ${opts.timeout}${unit}`);
-                    }
-                }
+                opts.timeout = Number(opts.timeout) || 8000;
                 if (isNode) {
                     const undici = eval("require('undici')");
                     const { socksDispatcher } = eval("require('fetch-socks')");
@@ -486,6 +503,7 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
                         request,
                         interceptors,
                     } = undici;
+                    const allowH2 = opts.allowH2 !== false;
                     const agentOpts = {
                         connect: {
                             rejectUnauthorized:
@@ -494,14 +512,17 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
                                 opts.rejectUnauthorized === false
                                     ? false
                                     : true,
+                            allowH2,
                         },
                         bodyTimeout: opts.timeout,
                         headersTimeout: opts.timeout,
                         maxHeaderSize,
+                        allowH2,
                     };
                     const tlsOptions = {
                         rejectUnauthorized:
                             agentOpts.connect.rejectUnauthorized,
+                        allowH2,
                     };
                     opts.tls = {
                         ...(opts.tls || {}),
@@ -519,6 +540,9 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
                                 ).toString('base64')}`,
                             };
                         }
+                        opts.headers = normalizeNodeRequestHeaders(
+                            opts.headers,
+                        );
                         let dispatcher;
                         if (!opts.proxy) {
                             const allProxy =
@@ -542,60 +566,90 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
                                     ...agentOpts,
                                     uri: opts.proxy,
                                     requestTls: tlsOptions,
+                                    proxyTunnel: opts.proxyTunnel,
                                 });
                             }
                         } else {
                             dispatcher = new EnvHttpProxyAgent({
                                 ...agentOpts,
                                 requestTls: tlsOptions,
+                                proxyTunnel: opts.proxyTunnel,
                             });
                         }
-                        const response = await request(opts.url, {
+                        request(opts.url, {
                             ...opts,
                             method: method.toUpperCase(),
                             dispatcher: dispatcher.compose(
                                 interceptors.redirect({
                                     maxRedirections: 3,
-                                    throwOnMaxRedirects: true,
+                                    throwOnMaxRedirect: true,
+                                }),
+                                interceptors.decompress({
+                                    skipErrorResponses: false,
                                 }),
                             ),
-                        });
-                        resolve({
-                            statusCode: response.statusCode,
-                            headers: response.headers,
-                            body:
-                                opts.encoding === null
-                                    ? await response.body.arrayBuffer()
-                                    : await response.body.text(),
-                        });
+                        })
+                            .then(async (response) => {
+                                const responseBody =
+                                    opts.encoding === null
+                                        ? await response.body.arrayBuffer()
+                                        : await response.body.text();
+
+                                resolve({
+                                    statusCode: response.statusCode,
+                                    headers: response.headers,
+                                    body: responseBody,
+                                    requestId,
+                                });
+                            })
+                            .catch(reject);
                     } catch (e) {
                         reject(e);
                     }
                 } else {
-                    $httpClient[method.toLowerCase()](
-                        opts,
-                        (err, response, body) => {
-                            // if (err) {
-                            //     console.log(err);
-                            // } else {
-                            //     console.log({
-                            //         statusCode:
-                            //             response.status || response.statusCode,
-                            //         headers: response.headers,
-                            //         body,
-                            //     });
-                            // }
+                    if (isSurge || isEgern || isStash || isShadowRocket) {
+                        opts.timeout = Math.ceil(opts.timeout / 1000);
+                    }
 
-                            if (err) reject(err);
-                            else
+                    // $.info(`🍉 [${requestId}] before http`);
+                    // $.info(
+                    //     `🍉 [${requestId}] opts.timeout =`,
+                    //     opts.timeout,
+                    // );
+
+                    // $.info(
+                    //     `🍉 [${requestId}] method =`,
+                    //     method.toUpperCase(),
+                    // );
+                    // const httpClientTs = Date.now();
+                    try {
+                        $httpClient[method.toLowerCase()](
+                            opts,
+                            (err, response, body) => {
+                                // $.info(
+                                //     ` [${requestId}] callback ${
+                                //         Date.now() - httpClientTs
+                                //     }ms`,
+                                // );
+
+                                if (err) {
+                                    reject(err);
+                                    return;
+                                }
+
                                 resolve({
                                     statusCode:
-                                        response.status || response.statusCode,
-                                    headers: response.headers,
+                                        response?.status ||
+                                        response?.statusCode,
+                                    headers: response?.headers || {},
                                     body,
+                                    requestId,
                                 });
-                        },
-                    );
+                            },
+                        );
+                    } catch (e) {
+                        reject(e);
+                    }
                 }
             });
         } else if (isGUIforCores) {
@@ -618,6 +672,7 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
                         statusCode: response.status,
                         headers: response.headers,
                         body: response.body,
+                        requestId,
                     });
                 } catch (error) {
                     reject(error);
@@ -625,33 +680,76 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
             });
         }
 
-        let timeoutid;
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            let settling = false;
+            let timeoutid = null;
 
-        const timer = timeout
-            ? new Promise((_, reject) => {
-                  //   console.log(`[request timeout] ${timeout}ms`);
-                  timeoutid = setTimeout(() => {
-                      events.onTimeout();
-                      return reject(
-                          `${method} URL: ${options.url} exceeds the timeout ${timeout} ms`,
-                      );
-                  }, timeout);
-              })
-            : null;
+            const cleanup = () => {
+                if (timeoutid !== null) {
+                    clearTimeout(timeoutid);
+                    timeoutid = null;
+                }
+            };
 
-        return (
-            timer
-                ? Promise.race([timer, worker]).then((res) => {
-                      if (typeof clearTimeout !== 'undefined') {
-                          clearTimeout(timeoutid);
-                      }
-                      return res;
-                  })
-                : worker
-        ).then((resp) => events.onResponse(resp));
+            const resolveOnce = async (value) => {
+                if (settled || settling) return;
+                settling = true;
+
+                try {
+                    await Promise.resolve(events.onResponse(value));
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    resolve({ ...value, requestId });
+                } catch (error) {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    reject(error);
+                }
+            };
+
+            const rejectOnce = (error) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(error);
+            };
+
+            worker.then(
+                async (value) => {
+                    // $.info(`🍉 [${requestId}] worker resolved`);
+                    await resolveOnce(value);
+                },
+                (error) => {
+                    rejectOnce(error);
+                },
+            );
+
+            if (timeout && !isEgern) {
+                timeoutid = setTimeout(() => {
+                    if (settled) {
+                        return;
+                    }
+
+                    try {
+                        events.onTimeout();
+                    } catch (e) {}
+
+                    rejectOnce(
+                        new Error(
+                            `${method} URL: ${options.url} exceeds the timeout ${timeout} ms`,
+                        ),
+                    );
+                }, timeout);
+            }
+        });
     }
 
-    const http = {};
+    const http = {
+        request: (options) => send(options.method || 'GET', options),
+    };
     methods.forEach(
         (method) =>
             (http[method.toLowerCase()] = (options) => send(method, options)),

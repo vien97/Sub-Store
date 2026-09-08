@@ -4,6 +4,26 @@ import { isNotBlank } from '@/utils';
 
 const targetPlatform = 'Surfboard';
 
+function hasNonBlankValue(value) {
+    return value != null && `${value}`.trim().length > 0;
+}
+
+function appendTlsProxyParams(result, proxy, enabled = true) {
+    if (!enabled) {
+        return;
+    }
+
+    result.appendIfPresent(
+        `,server-cert-fingerprint-sha256=${proxy['tls-fingerprint']}`,
+        'tls-fingerprint',
+    );
+    result.appendIfPresent(`,sni="${proxy.sni}"`, 'sni');
+    result.appendIfPresent(
+        `,skip-cert-verify=${proxy['skip-cert-verify']}`,
+        'skip-cert-verify',
+    );
+}
+
 export default function Surfboard_Producer() {
     const produce = (proxy) => {
         if (
@@ -26,14 +46,27 @@ export default function Surfboard_Producer() {
                 return http(proxy);
             case 'snell':
                 return snell(proxy);
+            case 'tuic':
+                return tuic(proxy);
             case 'socks5':
                 return socks5(proxy);
-            case 'anytls':
-                return anytls(proxy);
             case 'hysteria2':
                 return hysteria2(proxy);
             case 'wireguard-surge':
                 return wireguard(proxy);
+        }
+        if (proxy.type === 'anytls') {
+            if (
+                proxy.network &&
+                (!['tcp'].includes(proxy.network) ||
+                    (['tcp'].includes(proxy.network) && proxy['reality-opts']))
+            ) {
+                throw new Error(
+                    `Platform ${targetPlatform} does not support proxy type ${proxy.type} with network or REALITY`,
+                );
+            }
+
+            return anytls(proxy);
         }
         throw new Error(
             `Platform ${targetPlatform} does not support proxy type: ${proxy.type}`,
@@ -41,9 +74,41 @@ export default function Surfboard_Producer() {
     };
     return { produce };
 }
+function tuic(proxy) {
+    if (proxy.token?.length) {
+        throw new Error(
+            `Platform ${targetPlatform} does not support proxy type ${proxy.type} v4`,
+        );
+    }
+    const result = new Result(proxy);
+    result.append(`${proxy.name}=tuic-v5,${proxy.server},${proxy.port}`);
+    result.appendIfPresent(`,uuid=${proxy.uuid}`, 'uuid');
+    result.appendIfPresent(`,password="${proxy.password}"`, 'password');
+    if (hasNonBlankValue(proxy.alpn)) {
+        result.append(
+            `,alpn="${
+                Array.isArray(proxy.alpn) ? proxy.alpn.join(',') : proxy.alpn
+            }"`,
+        );
+    }
+    if (hasNonBlankValue(proxy.ports)) {
+        result.append(
+            `,port-hopping="${String(proxy.ports).replace(/,/g, ';')}"`,
+        );
+    }
+    if (hasNonBlankValue(proxy['hop-interval'])) {
+        result.append(`,port-hopping-interval=${proxy['hop-interval']}`);
+    }
+    appendTlsProxyParams(result, proxy);
+    result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
+    return result.toString();
+}
 function hysteria2(proxy) {
-    if (proxy.obfs || proxy['obfs-password']) {
-        throw new Error(`Surfboard Hysteria2 does not support obfs`);
+    if (
+        (proxy.obfs && proxy.obfs !== 'salamander') ||
+        (proxy['obfs-password'] && proxy.obfs !== 'salamander')
+    ) {
+        throw new Error(`Surfboard Hysteria2 only supports salamander obfs`);
     }
 
     const result = new Result(proxy);
@@ -51,21 +116,22 @@ function hysteria2(proxy) {
 
     result.appendIfPresent(`,password="${proxy.password}"`, 'password');
 
-    if (isPresent(proxy, 'ports')) {
-        result.append(`,port-hopping="${proxy.ports.replace(/,/g, ';')}"`);
+    if (hasNonBlankValue(proxy.ports)) {
+        result.append(
+            `,port-hopping="${String(proxy.ports).replace(/,/g, ';')}"`,
+        );
     }
 
-    result.appendIfPresent(
-        `,port-hopping-interval=${proxy['hop-interval']}`,
-        'hop-interval',
-    );
+    if (hasNonBlankValue(proxy['hop-interval'])) {
+        result.append(`,port-hopping-interval=${proxy['hop-interval']}`);
+    }
+
+    if (proxy['obfs-password']) {
+        result.append(`,salamander-password="${proxy['obfs-password']}"`);
+    }
 
     // tls verification
-    result.appendIfPresent(`,sni="${proxy.sni}"`, 'sni');
-    result.appendIfPresent(
-        `,skip-cert-verify=${proxy['skip-cert-verify']}`,
-        'skip-cert-verify',
-    );
+    appendTlsProxyParams(result, proxy);
 
     // download-bandwidth
     result.appendIfPresent(
@@ -76,6 +142,8 @@ function hysteria2(proxy) {
     // udp
     result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
 
+    result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+
     return result.toString();
 }
 function anytls(proxy) {
@@ -84,11 +152,7 @@ function anytls(proxy) {
     result.appendIfPresent(`,password="${proxy.password}"`, 'password');
 
     // tls verification
-    result.appendIfPresent(`,sni="${proxy.sni}"`, 'sni');
-    result.appendIfPresent(
-        `,skip-cert-verify=${proxy['skip-cert-verify']}`,
-        'skip-cert-verify',
-    );
+    appendTlsProxyParams(result, proxy);
 
     // tfo
     result.appendIfPresent(`,tfo=${proxy.tfo}`, 'tfo');
@@ -99,10 +163,15 @@ function anytls(proxy) {
     // reuse
     result.appendIfPresent(`,reuse=${proxy['reuse']}`, 'reuse');
 
+    result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+
     return result.toString();
 }
 function snell(proxy) {
-    if (proxy.version > 3) {
+    if (
+        isPresent(proxy, 'version') &&
+        ![1, 2, 3, 4, 5].includes(Number(proxy.version))
+    ) {
         throw new Error(
             `Platform ${targetPlatform} does not support snell version ${proxy.version}`,
         );
@@ -110,7 +179,7 @@ function snell(proxy) {
     const result = new Result(proxy);
     result.append(`${proxy.name}=${proxy.type},${proxy.server},${proxy.port}`);
     result.appendIfPresent(`,version=${proxy.version}`, 'version');
-    result.appendIfPresent(`,psk=${proxy.psk}`, 'psk');
+    result.appendIfPresent(`,psk="${proxy.psk}"`, 'psk');
 
     // obfs
     result.appendIfPresent(
@@ -133,6 +202,8 @@ function snell(proxy) {
     if (proxy.version >= 3) {
         result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
     }
+
+    result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
 
     return result.toString();
 }
@@ -190,6 +261,8 @@ function shadowsocks(proxy) {
     // udp
     result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
 
+    result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+
     return result.toString();
 }
 
@@ -205,17 +278,15 @@ function trojan(proxy) {
     result.appendIfPresent(`,tls=${proxy.tls}`, 'tls');
 
     // tls verification
-    result.appendIfPresent(`,sni="${proxy.sni}"`, 'sni');
-    result.appendIfPresent(
-        `,skip-cert-verify=${proxy['skip-cert-verify']}`,
-        'skip-cert-verify',
-    );
+    appendTlsProxyParams(result, proxy);
 
     // tfo
     result.appendIfPresent(`,tfo=${proxy.tfo}`, 'tfo');
 
     // udp
     result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
+
+    result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
 
     return result.toString();
 }
@@ -239,14 +310,12 @@ function vmess(proxy) {
     result.appendIfPresent(`,tls=${proxy.tls}`, 'tls');
 
     // tls verification
-    result.appendIfPresent(`,sni="${proxy.sni}"`, 'sni');
-    result.appendIfPresent(
-        `,skip-cert-verify=${proxy['skip-cert-verify']}`,
-        'skip-cert-verify',
-    );
+    appendTlsProxyParams(result, proxy, Boolean(proxy.tls));
 
     // udp
     result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
+
+    result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
 
     return result.toString();
 }
@@ -259,14 +328,12 @@ function http(proxy) {
     result.appendIfPresent(`,${proxy.password}`, 'password');
 
     // tls verification
-    result.appendIfPresent(`,sni="${proxy.sni}"`, 'sni');
-    result.appendIfPresent(
-        `,skip-cert-verify=${proxy['skip-cert-verify']}`,
-        'skip-cert-verify',
-    );
+    appendTlsProxyParams(result, proxy, Boolean(proxy.tls));
 
     // udp
     result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
+
+    result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
 
     return result.toString();
 }
@@ -279,14 +346,12 @@ function socks5(proxy) {
     result.appendIfPresent(`,${proxy.password}`, 'password');
 
     // tls verification
-    result.appendIfPresent(`,sni="${proxy.sni}"`, 'sni');
-    result.appendIfPresent(
-        `,skip-cert-verify=${proxy['skip-cert-verify']}`,
-        'skip-cert-verify',
-    );
+    appendTlsProxyParams(result, proxy, Boolean(proxy.tls));
 
     // udp
     result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
+
+    result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
 
     return result.toString();
 }
@@ -300,6 +365,8 @@ function wireguard(proxy) {
         `,section-name=${proxy['section-name']}`,
         'section-name',
     );
+
+    result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
 
     return result.toString();
 }

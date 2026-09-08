@@ -1,4 +1,6 @@
 name: build
+permissions:
+  contents: write
 on:
   workflow_dispatch:
   push:
@@ -6,26 +8,24 @@ on:
       - master
     paths:
       - "backend/package.json"
-  pull_request:
-    branches:
-      - master
-    paths:
-      - "backend/package.json"
+concurrency:
+  group: build
+  cancel-in-progress: true
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
         with:
           ref: "master"
       - name: Set up Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version-file: ".node-version"
       - name: Install dependencies
         run: |
-          npm install -g pnpm
+          corepack enable
           cd backend && pnpm i --no-frozen-lockfile
       - name: Sync latest mihomo version
         run: |
@@ -82,7 +82,7 @@ jobs:
           pnpm i -D conventional-changelog-cli
           pnpm run changelog
       - name: Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         if: ${{ success() }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -98,6 +98,7 @@ jobs:
             ./backend/dist/cron-sync-artifacts.min.js
             ./backend/dist/proxy-utils.esm.mjs
             ./backend/dist/sub-store.bundle.js
+            ./backend/dist/runtime-manifest.json
       - name: Git push assets to "release" branch
         run: |
           cd backend/dist || exit 1

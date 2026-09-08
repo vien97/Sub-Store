@@ -1,6 +1,38 @@
+import { Buffer } from 'buffer';
 import { isPresent, isShadowsocksOverTls, Result } from './utils';
+import { formatQXVmessMethod } from '../vmess-security';
 
 const targetPlatform = 'QX';
+
+function encodeQxAlpn(alpn) {
+    const protocols = (Array.isArray(alpn) ? alpn : `${alpn}`.split(','))
+        .map((protocol) => `${protocol}`.trim())
+        .filter(Boolean);
+
+    return (
+        protocols
+            .map((protocol) => {
+                const bytes = Buffer.from(protocol, 'utf8');
+                if (bytes.length > 255) {
+                    throw new Error('QX ALPN protocol exceeds 255 bytes');
+                }
+                return `${bytes.length
+                    .toString(16)
+                    .padStart(2, '0')}${bytes.toString('hex')}`;
+            })
+            .join('') || undefined
+    );
+}
+
+function appendTlsAlpn(result, proxy) {
+    if (isPresent(proxy, 'tls-alpn')) {
+        result.append(`,tls-alpn=${proxy['tls-alpn']}`);
+        return;
+    }
+
+    const encoded = isPresent(proxy, 'alpn') && encodeQxAlpn(proxy.alpn);
+    if (encoded) result.append(`,tls-alpn=${encoded}`);
+}
 
 export default function QX_Producer() {
     // eslint-disable-next-line no-unused-vars
@@ -64,6 +96,18 @@ function getQxHttpObfs(proxy) {
     )
         ? proxy._qx_obfs_http
         : 'http';
+}
+
+function appendTlsVerification(result, proxy) {
+    const attr = isPresent(proxy, 'name-cert-verify')
+        ? 'name-cert-verify'
+        : 'skip-cert-verify';
+    result.appendIfPresent(
+        `,tls-verification=${
+            proxy['name-cert-verify'] ?? !proxy['skip-cert-verify']
+        }`,
+        attr,
+    );
 }
 
 function shadowsocks(proxy) {
@@ -153,7 +197,7 @@ function shadowsocks(proxy) {
             `,tls-pubkey-sha256=${proxy['tls-pubkey-sha256']}`,
             'tls-pubkey-sha256',
         );
-        appendIfPresent(`,tls-alpn=${proxy['tls-alpn']}`, 'tls-alpn');
+        appendTlsAlpn(result, proxy);
         appendIfPresent(
             `,tls-no-session-ticket=${proxy['tls-no-session-ticket']}`,
             'tls-no-session-ticket',
@@ -169,10 +213,7 @@ function shadowsocks(proxy) {
         );
 
         // tls verification
-        appendIfPresent(
-            `,tls-verification=${!proxy['skip-cert-verify']}`,
-            'skip-cert-verify',
-        );
+        appendTlsVerification(result, proxy);
         if (!isSSOverTls) {
             appendIfPresent(`,tls-host=${proxy.sni}`, 'sni');
         }
@@ -284,7 +325,7 @@ function trojan(proxy) {
             `,tls-pubkey-sha256=${proxy['tls-pubkey-sha256']}`,
             'tls-pubkey-sha256',
         );
-        appendIfPresent(`,tls-alpn=${proxy['tls-alpn']}`, 'tls-alpn');
+        appendTlsAlpn(result, proxy);
         appendIfPresent(
             `,tls-no-session-ticket=${proxy['tls-no-session-ticket']}`,
             'tls-no-session-ticket',
@@ -300,10 +341,7 @@ function trojan(proxy) {
         );
 
         // tls verification
-        appendIfPresent(
-            `,tls-verification=${!proxy['skip-cert-verify']}`,
-            'skip-cert-verify',
-        );
+        appendTlsVerification(result, proxy);
         appendIfPresent(`,tls-host=${proxy.sni}`, 'sni');
     }
 
@@ -333,12 +371,7 @@ function vmess(proxy) {
     append(`vmess=${proxy.server}:${proxy.port}`);
 
     // cipher
-    let cipher;
-    if (proxy.cipher === 'auto') {
-        cipher = 'chacha20-ietf-poly1305';
-    } else {
-        cipher = proxy.cipher;
-    }
+    let cipher = formatQXVmessMethod(proxy.cipher);
     append(`,method=${cipher}`);
 
     append(`,password=${proxy.uuid}`);
@@ -383,7 +416,7 @@ function vmess(proxy) {
             `,tls-pubkey-sha256=${proxy['tls-pubkey-sha256']}`,
             'tls-pubkey-sha256',
         );
-        appendIfPresent(`,tls-alpn=${proxy['tls-alpn']}`, 'tls-alpn');
+        appendTlsAlpn(result, proxy);
         appendIfPresent(
             `,tls-no-session-ticket=${proxy['tls-no-session-ticket']}`,
             'tls-no-session-ticket',
@@ -399,10 +432,7 @@ function vmess(proxy) {
         );
 
         // tls verification
-        appendIfPresent(
-            `,tls-verification=${!proxy['skip-cert-verify']}`,
-            'skip-cert-verify',
-        );
+        appendTlsVerification(result, proxy);
         appendIfPresent(`,tls-host=${proxy.sni}`, 'sni');
     }
 
@@ -489,7 +519,7 @@ function vless(proxy) {
             `,tls-pubkey-sha256=${proxy['tls-pubkey-sha256']}`,
             'tls-pubkey-sha256',
         );
-        appendIfPresent(`,tls-alpn=${proxy['tls-alpn']}`, 'tls-alpn');
+        appendTlsAlpn(result, proxy);
         appendIfPresent(
             `,tls-no-session-ticket=${proxy['tls-no-session-ticket']}`,
             'tls-no-session-ticket',
@@ -505,10 +535,7 @@ function vless(proxy) {
         );
 
         // tls verification
-        appendIfPresent(
-            `,tls-verification=${!proxy['skip-cert-verify']}`,
-            'skip-cert-verify',
-        );
+        appendTlsVerification(result, proxy);
         appendIfPresent(`,tls-host=${proxy.sni}`, 'sni');
     }
 
@@ -554,7 +581,7 @@ function anytls(proxy) {
         `,tls-pubkey-sha256=${proxy['tls-pubkey-sha256']}`,
         'tls-pubkey-sha256',
     );
-    appendIfPresent(`,tls-alpn=${proxy['tls-alpn']}`, 'tls-alpn');
+    appendTlsAlpn(result, proxy);
     appendIfPresent(
         `,tls-no-session-ticket=${proxy['tls-no-session-ticket']}`,
         'tls-no-session-ticket',
@@ -567,10 +594,7 @@ function anytls(proxy) {
         `,tls-cert-sha256=${proxy['tls-fingerprint']}`,
         'tls-fingerprint',
     );
-    appendIfPresent(
-        `,tls-verification=${!proxy['skip-cert-verify']}`,
-        'skip-cert-verify',
-    );
+    appendTlsVerification(result, proxy);
     appendIfPresent(`,tls-host=${proxy.sni}`, 'sni');
 
     appendIfPresent(`,fast-open=${proxy.tfo}`, 'tfo');
@@ -606,7 +630,7 @@ function http(proxy) {
             `,tls-pubkey-sha256=${proxy['tls-pubkey-sha256']}`,
             'tls-pubkey-sha256',
         );
-        appendIfPresent(`,tls-alpn=${proxy['tls-alpn']}`, 'tls-alpn');
+        appendTlsAlpn(result, proxy);
         appendIfPresent(
             `,tls-no-session-ticket=${proxy['tls-no-session-ticket']}`,
             'tls-no-session-ticket',
@@ -622,10 +646,7 @@ function http(proxy) {
         );
 
         // tls verification
-        appendIfPresent(
-            `,tls-verification=${!proxy['skip-cert-verify']}`,
-            'skip-cert-verify',
-        );
+        appendTlsVerification(result, proxy);
         appendIfPresent(`,tls-host=${proxy.sni}`, 'sni');
     }
 
@@ -667,7 +688,7 @@ function socks5(proxy) {
             `,tls-pubkey-sha256=${proxy['tls-pubkey-sha256']}`,
             'tls-pubkey-sha256',
         );
-        appendIfPresent(`,tls-alpn=${proxy['tls-alpn']}`, 'tls-alpn');
+        appendTlsAlpn(result, proxy);
         appendIfPresent(
             `,tls-no-session-ticket=${proxy['tls-no-session-ticket']}`,
             'tls-no-session-ticket',
@@ -683,10 +704,7 @@ function socks5(proxy) {
         );
 
         // tls verification
-        appendIfPresent(
-            `,tls-verification=${!proxy['skip-cert-verify']}`,
-            'skip-cert-verify',
-        );
+        appendTlsVerification(result, proxy);
         appendIfPresent(`,tls-host=${proxy.sni}`, 'sni');
     }
 

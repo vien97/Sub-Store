@@ -22,9 +22,16 @@ import {
     normalizeXhttpIntegerValue,
     normalizeXhttpNonNegativeRange,
     normalizeXhttpPositiveRange,
-    normalizeXhttpScalarUpperBound,
+    normalizeXhttpStrictPositiveRangeString,
+    normalizeXhttpStrictPositiveRangeValue,
 } from '../xhttp-utils';
 import { extractPathQueryParam, getPathQueryParam } from '../transport-path';
+import {
+    buildMihomoEchOptsFromXrayFields,
+    isSupportedXrayEchConfigList,
+    isSupportedXrayEchForceQuery,
+} from '../ech-utils';
+import { normalizeVmessSecurity } from '../vmess-security';
 
 function surge_port_hopping(raw) {
     const [parts, port_hopping] =
@@ -95,6 +102,20 @@ function parseEarlyDataSize(value) {
         throw new Error(`bad WebSocket max early data size: ${value}`);
     }
     return parsed;
+}
+
+function splitURIHostList(host) {
+    if (Array.isArray(host)) {
+        return host.flatMap((item) => splitURIHostList(item) || []);
+    }
+    if (typeof host !== 'string') {
+        return host == null ? undefined : [host];
+    }
+    const hosts = host
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+    return hosts.length > 0 ? hosts : undefined;
 }
 
 function parseWireGuardURIAddressValue(value) {
@@ -400,6 +421,7 @@ function URI_SS() {
         // handle obfs
         const pluginMatch = content.match(/[?&]plugin=([^&]+)/);
         const shadowTlsMatch = content.match(/[?&]shadow-tls=([^&]+)/);
+        const gostMatch = content.match(/[?&]gost=([^&]+)/);
 
         if (pluginMatch) {
             const pluginInfo = (
@@ -481,6 +503,33 @@ function URI_SS() {
                 proxy.port = parseInt(port, 10);
             }
         }
+        if (gostMatch) {
+            const params = JSON.parse(
+                Base64.decode(decodeURIComponent(gostMatch[1])),
+            );
+            const address = getIfNotBlank(params['address']);
+            const port = getIfNotBlank(params['port']);
+            const route = getIfNotBlank(params['route']);
+            const normalizedRoute = route?.trim().toLowerCase();
+            const isWebsocketRoute = ['ws', 'wss', 'websocket'].includes(
+                normalizedRoute,
+            );
+            proxy.plugin = 'gost-plugin';
+            proxy['plugin-opts'] = {
+                mode: isWebsocketRoute ? 'websocket' : route,
+                host: getIfNotBlank(params['host']),
+                path: getIfNotBlank(params['path']),
+            };
+            if (normalizedRoute === 'wss') {
+                proxy['plugin-opts'].tls = true;
+            }
+            if (address) {
+                proxy.server = address;
+            }
+            if (port) {
+                proxy.port = parseInt(port, 10);
+            }
+        }
         if (/(&|\?)uot=(1|true)/i.test(query)) {
             proxy['udp-over-tcp'] = true;
         }
@@ -547,7 +596,9 @@ function URI_SSR() {
                 ? Base64.decode(other_params.remarks)
                 : proxy.server,
             'protocol-param': getIfNotBlank(
-                Base64.decode(other_params.protoparam || '').replace(/\s/g, ''),
+                Base64.decode(
+                    other_params.protoparam || other_params.protocolparam || '',
+                ).replace(/\s/g, ''),
             ),
             'obfs-param': getIfNotBlank(
                 Base64.decode(other_params.obfsparam || '').replace(/\s/g, ''),
@@ -589,7 +640,9 @@ function URI_VMess() {
                 type: 'vmess',
                 server: partitions[1],
                 port: partitions[2],
-                cipher: getIfNotBlank(partitions[3], 'auto'),
+                cipher: normalizeVmessSecurity(
+                    getIfNotBlank(partitions[3], 'auto'),
+                ),
                 uuid: partitions[4].match(/^"(.*)"$/)[1],
                 tls: params.obfs === 'wss',
                 udp: getIfPresent(params['udp-relay']),
@@ -671,14 +724,7 @@ function URI_VMess() {
                 port,
                 // https://github.com/2dust/v2rayN/wiki/Description-of-VMess-share-link
                 // https://github.com/XTLS/Xray-core/issues/91
-                cipher: [
-                    'auto',
-                    'aes-128-gcm',
-                    'chacha20-poly1305',
-                    'none',
-                ].includes(params.scy)
-                    ? params.scy
-                    : 'auto',
+                cipher: normalizeVmessSecurity(params.scy),
                 uuid: params.id,
                 alterId: parseInt(
                     getIfPresent(params.aid ?? params.alterId, 0),
@@ -707,11 +753,12 @@ function URI_VMess() {
             if (params.net === 'ws' || params.obfs === 'websocket') {
                 proxy.network = 'ws';
             } else if (
-                ['http'].includes(params.net) ||
                 ['http'].includes(params.obfs) ||
                 ['http'].includes(params.type)
             ) {
                 proxy.network = 'http';
+            } else if (params.net === 'http') {
+                proxy.network = 'h2';
             } else if (['grpc', 'kcp', 'quic'].includes(params.net)) {
                 proxy.network = params.net;
             } else if (
@@ -772,6 +819,10 @@ function URI_VMess() {
                     } else {
                         transportPath = '/';
                     }
+                } else if (proxy.network === 'h2') {
+                    if (!transportPath) {
+                        transportPath = '/';
+                    }
                 }
                 // 传输层应该有配置, 暂时不考虑兼容不给配置的节点
                 if (
@@ -799,8 +850,19 @@ function URI_VMess() {
                     } else {
                         const opts = {
                             path: getIfNotBlank(transportPath),
-                            headers: { Host: getIfNotBlank(transportHost) },
                         };
+                        const normalizedTransportHost =
+                            getIfNotBlank(transportHost);
+                        if (proxy.network === 'h2') {
+                            const h2Hosts = splitURIHostList(
+                                normalizedTransportHost,
+                            );
+                            if (h2Hosts) {
+                                opts.host = h2Hosts;
+                            }
+                        } else {
+                            opts.headers = { Host: normalizedTransportHost };
+                        }
                         if (httpupgrade) {
                             opts['v2ray-http-upgrade'] = true;
                             httpUpgradeEd =
@@ -893,7 +955,7 @@ function URI_VLESS() {
 
             const parsedHeaders = {};
             for (const [key, value] of Object.entries(headers)) {
-                if (typeof value === 'string' && value !== '') {
+                if (typeof value === 'string') {
                     parsedHeaders[key] = value;
                 }
             }
@@ -964,7 +1026,7 @@ function URI_VLESS() {
 
             const unsupportedHeaders = {};
             for (const [key, value] of Object.entries(headers)) {
-                if (typeof value === 'string' && value !== '') {
+                if (typeof value === 'string') {
                     continue;
                 }
 
@@ -1046,18 +1108,47 @@ function URI_VLESS() {
                         }
                         break;
                     case 'xPaddingBytes':
+                        if (
+                            normalizeXhttpStrictPositiveRangeString(value) ==
+                            null
+                        ) {
+                            setUnsupportedXhttpField(
+                                unsupportedExtra,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
                     case 'xPaddingKey':
                     case 'xPaddingHeader':
                     case 'xPaddingPlacement':
                     case 'xPaddingMethod':
                     case 'uplinkHTTPMethod':
+                    case 'sessionIDPlacement':
                     case 'sessionPlacement':
+                    case 'sessionIDKey':
                     case 'sessionKey':
                     case 'seqPlacement':
                     case 'seqKey':
                     case 'uplinkDataPlacement':
                     case 'uplinkDataKey':
-                        if (!isNotBlank(value)) {
+                        if (typeof value !== 'string') {
+                            setUnsupportedXhttpField(
+                                unsupportedExtra,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
+                    case 'sessionIDTable':
+                        // NOTE: Xray-core and mihomo both validate this field
+                        // together with sessionIDLength when the table is
+                        // non-empty: the table must stay ASCII, the length
+                        // range must stay > 0, and the combined ID space must
+                        // remain large enough. We only do local shape checks
+                        // here for now, so type-valid values are not
+                        // automatically upstream-valid yet.
+                        if (typeof value !== 'string') {
                             setUnsupportedXhttpField(
                                 unsupportedExtra,
                                 key,
@@ -1075,7 +1166,10 @@ function URI_VLESS() {
                         }
                         break;
                     case 'scMaxEachPostBytes':
-                        if (normalizeXhttpScalarUpperBound(value) == null) {
+                        if (
+                            normalizeXhttpStrictPositiveRangeString(value) ==
+                            null
+                        ) {
                             setUnsupportedXhttpField(
                                 unsupportedExtra,
                                 key,
@@ -1085,6 +1179,23 @@ function URI_VLESS() {
                         break;
                     case 'scMinPostsIntervalMs':
                         if (normalizeXhttpPositiveRange(value) == null) {
+                            setUnsupportedXhttpField(
+                                unsupportedExtra,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
+                    case 'sessionIDLength':
+                        // NOTE: Xray-core and mihomo treat this as a coupled
+                        // session-table/session-length constraint rather than a
+                        // standalone positive range. Keeping only the local
+                        // range normalization here does not guarantee the pair
+                        // will pass upstream validation.
+                        if (
+                            normalizeXhttpStrictPositiveRangeString(value) ==
+                            null
+                        ) {
                             setUnsupportedXhttpField(
                                 unsupportedExtra,
                                 key,
@@ -1235,14 +1346,50 @@ function URI_VLESS() {
                         }
 
                         const unsupportedTlsSettings = {};
+                        const hasSupportedEchConfigList =
+                            isSupportedXrayEchConfigList(value.echConfigList);
                         for (const [tlsKey, tlsValue] of Object.entries(
                             value,
                         )) {
                             switch (tlsKey) {
                                 case 'serverName':
                                 case 'fingerprint':
-                                case 'echConfigList':
                                     if (!isNotBlank(tlsValue)) {
+                                        setUnsupportedXhttpField(
+                                            unsupportedTlsSettings,
+                                            tlsKey,
+                                            tlsValue,
+                                        );
+                                    }
+                                    break;
+                                case 'echConfigList':
+                                    if (
+                                        !isSupportedXrayEchConfigList(tlsValue)
+                                    ) {
+                                        setUnsupportedXhttpField(
+                                            unsupportedTlsSettings,
+                                            tlsKey,
+                                            tlsValue,
+                                        );
+                                    }
+                                    break;
+                                case 'echForceQuery':
+                                    if (
+                                        !hasSupportedEchConfigList ||
+                                        !isSupportedXrayEchForceQuery(tlsValue)
+                                    ) {
+                                        setUnsupportedXhttpField(
+                                            unsupportedTlsSettings,
+                                            tlsKey,
+                                            tlsValue,
+                                        );
+                                    }
+                                    break;
+                                case 'echSockopt':
+                                    if (
+                                        !hasSupportedEchConfigList ||
+                                        !isPlainObject(tlsValue)
+                                    ) {
                                         setUnsupportedXhttpField(
                                             unsupportedTlsSettings,
                                             tlsKey,
@@ -1448,8 +1595,11 @@ function URI_VLESS() {
             if (extra.noGRPCHeader === true) {
                 target['no-grpc-header'] = true;
             }
-            if (isNotBlank(extra.xPaddingBytes)) {
-                target['x-padding-bytes'] = extra.xPaddingBytes;
+            const xPaddingBytes = normalizeXhttpStrictPositiveRangeString(
+                extra.xPaddingBytes,
+            );
+            if (xPaddingBytes != null) {
+                target['x-padding-bytes'] = xPaddingBytes;
             }
             if (extra.xPaddingObfsMode === true) {
                 target['x-padding-obfs-mode'] = true;
@@ -1469,12 +1619,27 @@ function URI_VLESS() {
             if (isNotBlank(extra.uplinkHTTPMethod)) {
                 target['uplink-http-method'] = extra.uplinkHTTPMethod;
             }
-            if (isNotBlank(extra.sessionPlacement)) {
+            if (isNotBlank(extra.sessionIDPlacement)) {
+                target['session-placement'] = extra.sessionIDPlacement;
+            } else if (isNotBlank(extra.sessionPlacement)) {
                 target['session-placement'] = extra.sessionPlacement;
             }
-            if (isNotBlank(extra.sessionKey)) {
+            if (isNotBlank(extra.sessionIDKey)) {
+                target['session-key'] = extra.sessionIDKey;
+            } else if (isNotBlank(extra.sessionKey)) {
                 target['session-key'] = extra.sessionKey;
             }
+            if (typeof extra.sessionIDTable === 'string') {
+                target['session-table'] = extra.sessionIDTable;
+            }
+
+            const sessionIDLength = normalizeXhttpStrictPositiveRangeString(
+                extra.sessionIDLength,
+            );
+            if (sessionIDLength != null) {
+                target['session-length'] = sessionIDLength;
+            }
+
             if (isNotBlank(extra.seqPlacement)) {
                 target['seq-placement'] = extra.seqPlacement;
             }
@@ -1495,7 +1660,7 @@ function URI_VLESS() {
                 target['uplink-chunk-size'] = uplinkChunkSize;
             }
 
-            const scMaxEachPostBytes = normalizeXhttpScalarUpperBound(
+            const scMaxEachPostBytes = normalizeXhttpStrictPositiveRangeValue(
                 extra.scMaxEachPostBytes,
             );
             if (scMaxEachPostBytes != null) {
@@ -1575,11 +1740,13 @@ function URI_VLESS() {
                 if (downloadSettings.tlsSettings.allowInsecure === true) {
                     parsedDownloadSettings['skip-cert-verify'] = true;
                 }
-                if (isNotBlank(downloadSettings.tlsSettings.echConfigList)) {
-                    parsedDownloadSettings['ech-opts'] = {
-                        enable: true,
-                        config: downloadSettings.tlsSettings.echConfigList,
-                    };
+                const echOpts = buildMihomoEchOptsFromXrayFields({
+                    echConfigList: downloadSettings.tlsSettings.echConfigList,
+                    echForceQuery: downloadSettings.tlsSettings.echForceQuery,
+                    echSockopt: downloadSettings.tlsSettings.echSockopt,
+                });
+                if (echOpts) {
+                    parsedDownloadSettings['ech-opts'] = echOpts;
                 }
             }
 
@@ -1711,17 +1878,29 @@ function URI_VLESS() {
         proxy.alpn = params.alpn ? params.alpn.split(',') : undefined;
         proxy['skip-cert-verify'] = /(TRUE)|1/i.test(params.allowInsecure);
         proxy._echConfigList = getIfPresent(params.ech);
+        const echOpts = buildMihomoEchOptsFromXrayFields({
+            echConfigList: params.ech,
+        });
+        if (echOpts) {
+            proxy['ech-opts'] = echOpts;
+        }
         proxy['tls-fingerprint'] = getIfPresent(params.pcs);
+        proxy._vcn = params.vcn
+            ?.split(',')
+            .map((name) => name.trim())
+            .filter(Boolean);
+        proxy['name-cert-verify'] = proxy._vcn?.[0];
         proxy._h2 = /(TRUE)|1/i.test(params.h2);
 
-        switch (`${params.packetEncoding || ''}`.toLowerCase()) {
+        switch (`${params.packetEncoding || ''}`.trim().toLowerCase()) {
             case 'none':
+                proxy['packet-encoding'] = '';
                 break;
             case 'packet':
-                proxy['packet-addr'] = true;
+                proxy['packet-encoding'] = 'packetaddr';
                 break;
             default:
-                proxy.xudp = true;
+                proxy['packet-encoding'] = 'xudp';
                 break;
         }
 
@@ -1783,6 +1962,15 @@ function URI_VLESS() {
                         delete opts.headers;
                     }
                 }
+                const h2Host = opts.headers?.Host ?? opts.headers?.host;
+                if (['h2'].includes(proxy.network) && h2Host) {
+                    opts.host = splitURIHostList(h2Host);
+                    delete opts.headers.Host;
+                    delete opts.headers.host;
+                    if (Object.keys(opts.headers).length === 0) {
+                        delete opts.headers;
+                    }
+                }
             }
             if (params.serviceName) {
                 opts[`${proxy.network}-service-name`] = params.serviceName;
@@ -1803,6 +1991,8 @@ function URI_VLESS() {
                     pathEarlyData = extracted.ed;
                 }
                 opts.path = transportPath;
+            } else if (proxy.network === 'h2') {
+                opts.path = '/';
             }
             if (proxy.network === 'http' && params.method) {
                 opts.method = params.method;
@@ -2054,6 +2244,18 @@ function URI_Hysteria2() {
 
         if (/^\d+$/.test(keepalive)) {
             proxy['keepalive'] = parseInt(`${keepalive}`, 10);
+        }
+        if (params.upmbps) {
+            proxy.up = params.upmbps;
+        }
+        if (params.downmbps) {
+            proxy.down = params.downmbps;
+        }
+        const echOpts = buildMihomoEchOptsFromXrayFields({
+            echConfigList: params.ech,
+        });
+        if (echOpts) {
+            proxy['ech-opts'] = echOpts;
         }
 
         return proxy;
@@ -2335,8 +2537,13 @@ function Clash_All() {
         }
         if (
             ![
+                'zerotier',
+                'shadowquic',
+                'gost-relay',
+                'openvpn',
                 'tailscale',
                 'trusttunnel',
+                'h2-connect',
                 'naive',
                 'anytls',
                 'mieru',
@@ -2384,6 +2591,9 @@ function Clash_All() {
         }
         if (proxy['benchmark-timeout']) {
             proxy['test-timeout'] = proxy['benchmark-timeout'];
+        }
+        if (proxy.type === 'vmess') {
+            proxy.cipher = normalizeVmessSecurity(proxy.cipher);
         }
 
         return proxy;
@@ -2697,6 +2907,27 @@ function Surge_TrustTunnel() {
     const parse = (line) => getSurgeParser().parse(line);
     return { name, test, parse };
 }
+function Surge_Masque() {
+    const name = 'Surge MASQUE Parser';
+    const test = (line) => {
+        return /^.*=\s*masque/.test(line.split(',')[0]);
+    };
+    const parse = (raw) => {
+        const { port_hopping, line } = surge_port_hopping(raw);
+        const proxy = getSurgeParser().parse(line);
+        proxy.ports = port_hopping;
+        return proxy;
+    };
+    return { name, test, parse };
+}
+function Surge_H2Connect() {
+    const name = 'Surge HTTP/2 CONNECT Parser';
+    const test = (line) => {
+        return /^.*=\s*h2-connect/.test(line.split(',')[0]);
+    };
+    const parse = (line) => getSurgeParser().parse(line);
+    return { name, test, parse };
+}
 function Surge_SSH() {
     const name = 'Surge SSH Parser';
     const test = (line) => {
@@ -2901,6 +3132,8 @@ export default [
     Surge_Direct(),
     Surge_AnyTLS(),
     Surge_TrustTunnel(),
+    Surge_Masque(),
+    Surge_H2Connect(),
     Surge_SSH(),
     Surge_SS(),
     Surge_VMess(),

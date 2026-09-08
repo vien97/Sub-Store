@@ -11,6 +11,8 @@ import { failed, success } from '@/restful/response';
 import $ from '@/core/app';
 import { RequestInvalidError, ResourceNotFoundError } from '@/restful/errors';
 import { formatDateTime } from '@/utils';
+import { normalizeAgePublicKeyConfig } from '@/utils/age';
+import { normalizeEditorLanguageConfig } from '@/utils/editor-language';
 
 export default function register($app) {
     if (!$.read(COLLECTIONS_KEY)) $.write({}, COLLECTIONS_KEY);
@@ -44,6 +46,7 @@ function getCollection(req, res) {
     if (collection) {
         if (raw) {
             res.set('content-type', 'application/json')
+                .set('access-control-expose-headers', 'content-disposition')
                 .set(
                     'content-disposition',
                     `attachment; filename="${encodeURIComponent(
@@ -79,6 +82,8 @@ function updateCollection(req, res) {
             ...oldCol,
             ...collection,
         };
+        normalizeAgePublicKeyConfig(newCol);
+        normalizeEditorLanguageConfig(newCol);
         $.info(`正在更新组合订阅：${name}...`);
 
         if (name !== newCol.name) {
@@ -141,12 +146,22 @@ function getAllCollections(req, res) {
 }
 
 function replaceCollection(req, res) {
-    const allCols = req.body;
-    $.write(allCols, COLLECTIONS_KEY);
-    success(res);
+    try {
+        const allCols = req.body;
+        allCols.forEach((collection) => {
+            normalizeAgePublicKeyConfig(collection);
+            normalizeEditorLanguageConfig(collection);
+        });
+        $.write(allCols, COLLECTIONS_KEY);
+        success(res);
+    } catch (error) {
+        failed(res, error);
+    }
 }
 
 function createCollectionItem(collection) {
+    normalizeAgePublicKeyConfig(collection);
+    normalizeEditorLanguageConfig(collection);
     $.info(`正在创建组合订阅：${collection.name}`);
     if (/\//.test(collection.name)) {
         throw new RequestInvalidError(

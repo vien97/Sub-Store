@@ -1,14 +1,19 @@
 import {
     getWireGuardAddressWithCIDR,
     isPresent,
+    normalizePluginMuxBooleanValue,
     produceProxyListOutput,
+    restoreShadowTLSProxyOpts,
     supportsShadowsocksV2rayPluginMode,
 } from '@/core/proxy-utils/producers/utils';
+import { isNotBlank, isPlainObject } from '@/utils';
 import {
     deleteHttpUpgradeEarlyDataMetadata,
     normalizeWebSocketEarlyDataPath,
 } from '../transport-path';
+import { ECH_DNS_FIELD } from '../ech-utils';
 import $ from '@/core/app';
+import { normalizeVmessSecurity } from '../vmess-security';
 
 const ipVersions = {
     dual: 'dual',
@@ -18,19 +23,96 @@ const ipVersions = {
     'prefer-v6': 'ipv6-prefer',
 };
 
+function warnMihomoUnsupportedEchDns(proxy, echOpts, echOptsPath) {
+    if (!isPlainObject(echOpts) || !isNotBlank(echOpts[ECH_DNS_FIELD])) {
+        return;
+    }
+
+    const queryServerName = isNotBlank(echOpts['query-server-name'])
+        ? echOpts['query-server-name']
+        : '这里是 query-server-name';
+    $.warn(
+        `mihomo 不支持在 ech-opts 中配置 ECH DNS. 如需跟节点 ECH 配置一致, 请在 mihomo 配置文件里设置 dns["nameserver-policy"]["${queryServerName}"] = ["${echOpts[ECH_DNS_FIELD]}"].`,
+    );
+}
+
+function warnMihomoUnsupportedEchDnsFields(proxy, type) {
+    if (type === 'internal') {
+        return;
+    }
+
+    warnMihomoUnsupportedEchDns(proxy, proxy['ech-opts'], 'ech-opts');
+    warnMihomoUnsupportedEchDns(
+        proxy,
+        proxy['xhttp-opts']?.['download-settings']?.['ech-opts'],
+        'xhttp-opts.download-settings.ech-opts',
+    );
+}
+
 export default function ClashMeta_Producer() {
     const type = 'ALL';
     const produce = (proxies, type, opts = {}) => {
         const list = proxies
             .filter((proxy) => {
                 if (opts['include-unsupported-proxy']) return true;
+
+                if (proxy.type === 'h2-connect') {
+                    $.error(
+                        `mihomo does not support HTTP/2 CONNECT proxy type. Proxy ${proxy.name} has been filtered.`,
+                    );
+                    return false;
+                }
+                if (hasRootHeaders(proxy) && proxy.type === 'trusttunnel') {
+                    $.error(
+                        `mihomo does not support headers for TrustTunnel proxy ${proxy.name}. Proxy has been filtered.`,
+                    );
+                    return false;
+                }
                 if (!supportsShadowsocksV2rayPluginMode(proxy, ['websocket'])) {
                     return false;
-                } else if (proxy.type === 'snell' && proxy.version >= 4) {
+                } else if (
+                    proxy.type === 'snell' &&
+                    !isSupportedMihomoVersion(proxy.version, [1, 2, 3, 4, 5])
+                ) {
                     return false;
                 } else if (
-                    ['tailscale', 'juicity', 'naive'].includes(proxy.type)
+                    hasMihomoShadowTls(proxy) &&
+                    (![
+                        'ss',
+                        'snell',
+                        'vmess',
+                        'vless',
+                        'trojan',
+                        'anytls',
+                    ].includes(proxy.type) ||
+                        !isSupportedMihomoVersion(
+                            getMihomoShadowTlsVersion(proxy),
+                            ['ss', 'snell'].includes(proxy.type)
+                                ? [1, 2, 3]
+                                : [0, 1, 2, 3],
+                        ))
                 ) {
+                    return false;
+                } else if (
+                    proxy.type === 'vless' &&
+                    proxy.network === 'xhttp' &&
+                    hasMihomoShadowTls(
+                        proxy['xhttp-opts']?.['download-settings'],
+                    ) &&
+                    !isSupportedMihomoVersion(
+                        getMihomoShadowTlsVersion(
+                            proxy['xhttp-opts']['download-settings'],
+                        ),
+                        [0, 1, 2, 3],
+                    )
+                ) {
+                    return false;
+                } else if (hasMihomoSnellShadowTlsObfsConflict(proxy)) {
+                    $.error(
+                        `Platform Mihomo does not support Snell shadow-tls with obfs for proxy ${proxy.name}. Proxy has been filtered.`,
+                    );
+                    return false;
+                } else if (['juicity', 'naive'].includes(proxy.type)) {
                     return false;
                 } else if (
                     ['ss'].includes(proxy.type) &&
@@ -90,6 +172,10 @@ export default function ClashMeta_Producer() {
                 return true;
             })
             .map((proxy) => {
+                warnMihomoUnsupportedEchDnsFields(proxy, type);
+
+                restoreShadowTLSProxyOpts(proxy);
+
                 if (proxy['reality-opts'] && !proxy['client-fingerprint']) {
                     proxy['client-fingerprint'] = 'chrome';
                 }
@@ -107,18 +193,7 @@ export default function ClashMeta_Producer() {
                     }
                     // https://github.com/MetaCubeX/Clash.Meta/blob/Alpha/docs/config.yaml#L400
                     // https://stash.wiki/proxy-protocols/proxy-types#vmess
-                    if (
-                        isPresent(proxy, 'cipher') &&
-                        ![
-                            'auto',
-                            'none',
-                            'zero',
-                            'aes-128-gcm',
-                            'chacha20-poly1305',
-                        ].includes(proxy.cipher)
-                    ) {
-                        proxy.cipher = 'auto';
-                    }
+                    proxy.cipher = normalizeVmessSecurity(proxy.cipher);
                 } else if (proxy.type === 'tuic') {
                     if (isPresent(proxy, 'alpn')) {
                         proxy.alpn = Array.isArray(proxy.alpn)
@@ -203,20 +278,35 @@ export default function ClashMeta_Producer() {
                             ds['reality-opts'] = { 'public-key': '' };
                         }
                     }
-                } else if (proxy.type === 'ss') {
-                    if (
-                        isPresent(proxy, 'shadow-tls-password') &&
-                        !isPresent(proxy, 'plugin')
-                    ) {
-                        proxy.plugin = 'shadow-tls';
-                        proxy['plugin-opts'] = {
-                            host: proxy['shadow-tls-sni'],
-                            password: proxy['shadow-tls-password'],
-                            version: proxy['shadow-tls-version'],
+                } else if (
+                    ['anytls'].includes(proxy.type) &&
+                    proxy.reuse != null &&
+                    !proxy.reuse
+                ) {
+                    proxy['disable-reuse'] = true;
+                    delete proxy.reuse;
+                }
+
+                if (isPresent(proxy, 'plugin-opts.mux')) {
+                    proxy['plugin-opts'].mux = normalizePluginMuxBooleanValue(
+                        proxy['plugin-opts'].mux,
+                    );
+                }
+
+                if (proxy.type === 'snell') {
+                    const shadowTLSOpts = getMihomoShadowTlsOpts(proxy);
+                    if (shadowTLSOpts) {
+                        proxy['obfs-opts'] = {
+                            mode: 'shadow-tls',
+                            host: shadowTLSOpts.host,
+                            password: shadowTLSOpts.password,
+                            version: shadowTLSOpts.version,
                         };
-                        delete proxy['shadow-tls-password'];
-                        delete proxy['shadow-tls-sni'];
-                        delete proxy['shadow-tls-version'];
+                        if (shadowTLSOpts.alpn) {
+                            proxy['obfs-opts'].alpn = shadowTLSOpts.alpn;
+                        }
+                        delete proxy.plugin;
+                        delete proxy['plugin-opts'];
                     }
                 }
 
@@ -250,12 +340,27 @@ export default function ClashMeta_Producer() {
                     ) {
                         proxy['h2-opts'].path = path[0];
                     }
-                    let host = proxy['h2-opts']?.headers?.host;
+                    let host =
+                        proxy['h2-opts']?.host ??
+                        proxy['h2-opts']?.headers?.host ??
+                        proxy['h2-opts']?.headers?.Host;
                     if (
-                        isPresent(proxy, 'h2-opts.headers.Host') &&
-                        !Array.isArray(host)
+                        isPresent(proxy, 'h2-opts.host') ||
+                        isPresent(proxy, 'h2-opts.headers.host') ||
+                        isPresent(proxy, 'h2-opts.headers.Host')
                     ) {
-                        proxy['h2-opts'].headers.host = [host];
+                        proxy['h2-opts'].host = Array.isArray(host)
+                            ? host
+                            : [host];
+                    }
+                    if (proxy['h2-opts']?.headers) {
+                        delete proxy['h2-opts'].headers.host;
+                        delete proxy['h2-opts'].headers.Host;
+                        if (
+                            Object.keys(proxy['h2-opts'].headers).length === 0
+                        ) {
+                            delete proxy['h2-opts'].headers;
+                        }
                     }
                 }
                 if (['ws'].includes(proxy.network)) {
@@ -284,6 +389,8 @@ export default function ClashMeta_Producer() {
                         'anytls',
                         'trusttunnel',
                         'naive',
+                        'masque',
+                        'shadowquic',
                     ].includes(proxy.type)
                 ) {
                     delete proxy.tls;
@@ -337,4 +444,58 @@ export default function ClashMeta_Producer() {
         return produceProxyListOutput(list, type, opts);
     };
     return { type, produce };
+}
+
+function hasRootHeaders(proxy) {
+    return (
+        proxy?.headers &&
+        typeof proxy.headers === 'object' &&
+        Object.keys(proxy.headers).length > 0
+    );
+}
+
+function isSupportedMihomoVersion(version, supportedVersions) {
+    if (version == null) {
+        return true;
+    }
+
+    const normalized =
+        typeof version === 'string' ? version.trim() : `${version}`;
+    if (!normalized) {
+        return false;
+    }
+
+    const parsed = Number(normalized);
+    return Number.isInteger(parsed) && supportedVersions.includes(parsed);
+}
+
+function hasMihomoShadowTls(proxy) {
+    return Boolean(getMihomoShadowTlsOpts(proxy));
+}
+
+function hasMihomoSnellShadowTlsObfsConflict(proxy) {
+    return (
+        proxy?.type === 'snell' &&
+        proxy?.plugin === 'shadow-tls' &&
+        (isPresent(proxy, 'obfs-opts.mode') ||
+            isPresent(proxy, 'obfs-opts.host') ||
+            isPresent(proxy, 'obfs-opts.path'))
+    );
+}
+
+function getMihomoShadowTlsVersion(proxy) {
+    return getMihomoShadowTlsOpts(proxy)?.version;
+}
+
+function getMihomoShadowTlsOpts(proxy) {
+    if (proxy?.plugin === 'shadow-tls' && proxy?.['plugin-opts']) {
+        return proxy['plugin-opts'];
+    }
+    if (
+        proxy?.type === 'snell' &&
+        proxy?.['obfs-opts']?.mode === 'shadow-tls'
+    ) {
+        return proxy['obfs-opts'];
+    }
+    return undefined;
 }

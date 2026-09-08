@@ -1,6 +1,7 @@
 import _ from 'lodash';
 import YAML from '@/utils/yaml';
 import { isIPv4, isIPv6 } from '@/utils';
+import { normalizeClashYaml } from '@/core/proxy-utils/preprocessors';
 
 export class Result {
     constructor(proxy) {
@@ -55,6 +56,10 @@ export function normalizePluginMuxValue(mux) {
     return mux;
 }
 
+export function normalizePluginMuxBooleanValue(mux) {
+    return Boolean(normalizePluginMuxValue(mux));
+}
+
 export function supportsShadowsocksV2rayPluginMode(proxy, supportedModes) {
     if (proxy?.type !== 'ss' || proxy?.plugin !== 'v2ray-plugin') return true;
 
@@ -64,6 +69,42 @@ export function supportsShadowsocksV2rayPluginMode(proxy, supportedModes) {
             : proxy?.['plugin-opts']?.mode;
 
     return supportedModes.includes(normalizedMode);
+}
+
+function restoreShadowTLSOpts(target, serverNameKey) {
+    if (target?.plugin !== 'shadow-tls' || !target['plugin-opts']) {
+        return undefined;
+    }
+
+    const opts = target['plugin-opts'];
+    const enabled =
+        Boolean(opts.password) ||
+        (opts.version != null && Number(opts.version) !== 0);
+    target['shadow-tls-opts'] = {
+        password: opts.password,
+        version: opts.version,
+    };
+    if (opts.host != null) target[serverNameKey] = opts.host;
+    if (opts.alpn != null) target.alpn = opts.alpn;
+    delete target.plugin;
+    delete target['plugin-opts'];
+    return enabled;
+}
+
+export function restoreShadowTLSProxyOpts(proxy) {
+    if (['vmess', 'vless', 'trojan', 'anytls'].includes(proxy.type)) {
+        const restored = restoreShadowTLSOpts(proxy, 'sni');
+        if (restored && ['vmess', 'vless'].includes(proxy.type)) {
+            proxy.tls = true;
+        }
+    }
+
+    if (proxy.type === 'vless' && proxy.network === 'xhttp') {
+        const downloadSettings = proxy['xhttp-opts']?.['download-settings'];
+        if (restoreShadowTLSOpts(downloadSettings, 'servername')) {
+            downloadSettings.tls = true;
+        }
+    }
 }
 
 function parseWireGuardCIDR(cidr, max) {
@@ -138,26 +179,29 @@ export function getWireGuardAddressWithCIDR(proxy = {}, family = 'ipv4') {
         proxy[config.cidrKey],
         config.defaultCIDR,
     );
-    return `${parsed.address}/${normalizedCIDR ?? parsed.cidr ?? config.defaultCIDR}`;
+    return `${parsed.address}/${
+        normalizedCIDR ?? parsed.cidr ?? config.defaultCIDR
+    }`;
 }
 
 export function produceProxyListOutput(list, type, opts = {}) {
     if (type === 'internal') return list;
 
-    if (
-        opts.prettyYaml ||
-        opts['pretty-yaml']
-    ) {
-        return YAML.safeDump(
-            {
-                proxies: list,
-            },
-            {
-                lineWidth: -1,
-            },
+    if (opts.prettyYaml || opts['pretty-yaml']) {
+        return normalizeClashYaml(
+            YAML.safeDump(
+                {
+                    proxies: list,
+                },
+                {
+                    lineWidth: -1,
+                },
+            ),
         );
     }
 
-    return 'proxies:\n' +
-        list.map((proxy) => '  - ' + JSON.stringify(proxy) + '\n').join('');
+    return (
+        'proxies:\n' +
+        list.map((proxy) => '  - ' + JSON.stringify(proxy) + '\n').join('')
+    );
 }
