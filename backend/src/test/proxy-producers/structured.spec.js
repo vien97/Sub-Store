@@ -315,8 +315,8 @@ describe('Proxy structured producers', function () {
         }
     });
 
-    it('keeps Mihomo and Stash Snell versions 1 through 5', function () {
-        const proxies = [1, 2, 3, 4, 5, 6].map((version) => ({
+    it('keeps Mihomo Snell versions 1 through 5 and Stash versions 1 through 6', function () {
+        const proxies = [1, 2, 3, 4, 5, 6, 7].map((version) => ({
             type: 'snell',
             name: `Snell ${version}`,
             server: 'snell.example.com',
@@ -326,7 +326,10 @@ describe('Proxy structured producers', function () {
             udp: true,
         }));
 
-        for (const platform of ['Mihomo', 'Stash']) {
+        for (const [platform, expectedVersions] of [
+            ['Mihomo', [1, 2, 3, 4, 5]],
+            ['Stash', [1, 2, 3, 4, 5, 6]],
+        ]) {
             const internal = produceInternal(
                 platform,
                 proxies.map((proxy) => ({ ...proxy })),
@@ -339,11 +342,11 @@ describe('Proxy structured producers', function () {
             expect(
                 internal.map((proxy) => proxy.version),
                 platform,
-            ).to.deep.equal([1, 2, 3, 4, 5]);
+            ).to.deep.equal(expectedVersions);
             expect(
                 external.proxies.map((proxy) => proxy.version),
                 platform,
-            ).to.deep.equal([1, 2, 3, 4, 5]);
+            ).to.deep.equal(expectedVersions);
             expect(
                 internal.find((proxy) => proxy.version === 1),
                 platform,
@@ -352,14 +355,12 @@ describe('Proxy structured producers', function () {
                 internal.find((proxy) => proxy.version === 2),
                 platform,
             ).to.not.have.property('udp');
-            expect(internal.find((proxy) => proxy.version === 4).udp).to.equal(
-                true,
-                platform,
-            );
-            expect(internal.find((proxy) => proxy.version === 5).udp).to.equal(
-                true,
-                platform,
-            );
+            for (const version of expectedVersions.filter((v) => v >= 3)) {
+                expect(
+                    internal.find((proxy) => proxy.version === version).udp,
+                    platform,
+                ).to.equal(true);
+            }
         }
     });
 
@@ -2763,6 +2764,57 @@ describe('Proxy structured producers', function () {
             servername: 'a.com',
         });
         // expect(external.proxies[0]).to.not.have.property('sni');
+    });
+
+    it('maps IP version aliases into Egern internal and YAML output', function () {
+        const cases = [
+            ['dual', 'dual_stack'],
+            ['ipv4', 'v4_only'],
+            ['ipv6', 'v6_only'],
+            ['v4-only', 'v4_only'],
+            ['v6-only', 'v6_only'],
+            ['ipv4-prefer', 'v4_prefer'],
+            ['ipv6-prefer', 'v6_prefer'],
+            ['prefer-v4', 'v4_prefer'],
+            ['prefer-v6', 'v6_prefer'],
+            ['dual_stack', 'dual_stack'],
+            ['v4_only', 'v4_only'],
+            ['v6_only', 'v6_only'],
+            ['v4_prefer', 'v4_prefer'],
+            ['v6_prefer', 'v6_prefer'],
+            [undefined, undefined],
+            [null, undefined],
+            ['', undefined],
+        ];
+        const proxies = cases.map(([ipVersion], index) => ({
+            type: 'ss',
+            name: `Egern IP Version ${index}`,
+            server: 'ss.example.com',
+            port: 8388,
+            cipher: 'aes-128-gcm',
+            password: 'secret',
+            'ip-version': ipVersion,
+        }));
+
+        for (const output of [
+            produceInternal('Egern', proxies),
+            loadProducedYaml('Egern', proxies).proxies,
+            loadProducedYaml('Egern', proxies, { prettyYaml: true }).proxies,
+        ]) {
+            expect(output).to.have.length(cases.length);
+            output.forEach(({ shadowsocks }, index) => {
+                const expected = cases[index][1];
+                if (expected === undefined) {
+                    expect(shadowsocks).to.not.have.property('ip_version');
+                } else {
+                    expect(shadowsocks).to.have.property(
+                        'ip_version',
+                        expected,
+                    );
+                }
+                expect(shadowsocks).to.not.have.property('ip-version');
+            });
+        }
     });
 
     it('maps shadowsocks shadow-tls plugin objects into Egern nested structures', function () {
