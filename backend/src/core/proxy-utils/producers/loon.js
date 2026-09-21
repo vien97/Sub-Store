@@ -56,7 +56,15 @@ export default function Loon_Producer() {
             `Platform ${targetPlatform} does not support proxy type: ${proxy.type}`,
         );
     };
-    return { produce };
+    return {
+        produce: (proxy, type, opts = {}) => {
+            const result = produce(proxy, type, opts);
+            const serverDns = proxy['server-dns'];
+            return Array.isArray(serverDns) && serverDns.length > 0
+                ? `${result},server-dns="${serverDns.join(',')}"`
+                : result;
+        },
+    };
 }
 
 function appendTlsProfile(result, proxy) {
@@ -124,13 +132,15 @@ function getLoonAlpn(proxy) {
 
 function getLoonTlsProfile(proxy) {
     const tlsProfile = `${proxy._loon_tls_profile || ''}`.trim();
-    if (['default', 'chrome', 'ios18', 'ios26'].includes(tlsProfile)) {
+    if (
+        ['default', 'chrome', 'chrome147', 'ios18', 'ios26'].includes(tlsProfile)
+    ) {
         return tlsProfile;
     }
 
     switch (`${proxy['client-fingerprint'] || ''}`.trim()) {
         case 'chrome':
-            return 'chrome';
+            return 'chrome147';
         case 'ios':
             return 'ios26';
     }

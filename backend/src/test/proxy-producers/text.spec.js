@@ -461,6 +461,97 @@ describe('Proxy text producers', function () {
         expect(output).to.equal(raw);
     });
 
+    it('round-trips quoted and unquoted Loon server-dns for every protocol', function () {
+        const inputs = [
+            'SS=shadowsocks,ss.example.com,8388,aes-128-gcm,"secret"',
+            'SSR=shadowsocksr,ssr.example.com,8388,aes-256-cfb,"secret",protocol=origin,obfs=plain',
+            `VMess=vmess,vmess.example.com,443,auto,"${UUID}"`,
+            `VLESS=vless,vless.example.com,443,"${UUID}"`,
+            'Trojan=trojan,trojan.example.com,443,"secret"',
+            'AnyTLS=anytls,anytls.example.com,443,"secret"',
+            'Hysteria2=hysteria2,hy2.example.com,443,"secret"',
+            'HTTP=http,http.example.com,8080',
+            'HTTPS=https,https.example.com,443',
+            'SOCKS5=socks5,socks.example.com,1080',
+            'WG=wireguard,interface-ip=10.0.0.2,private-key=private-key,peers=[{endpoint=wg.example.com:51820,public-key=public-key,allowed-ips="0.0.0.0/0"}]',
+        ];
+        const serverDns = [
+            'system',
+            '223.5.5.5',
+            '223.5.5.5:53',
+            '2001:4860:4860::8888',
+            '[2001:4860:4860::8888]:53',
+            'https://dns.example.com/dns-query',
+            'quic://dns.example.com',
+            'h3://dns.example.com/dns-query',
+        ];
+
+        for (const input of inputs) {
+            for (const values of [
+                ...serverDns.map((dns) => [dns]),
+                serverDns,
+            ]) {
+                for (const quote of ['', '"']) {
+                    const proxies = ProxyUtils.parse(
+                        `${input},server-dns=${quote}${values.join(
+                            ',',
+                        )}${quote}`,
+                    );
+                    expect(proxies, input).to.have.length(1);
+                    expect(proxies[0]['server-dns'], input).to.deep.equal(
+                        values,
+                    );
+                    const output = produceExternal('Loon', proxies);
+                    expect(output).to.include(
+                        `,server-dns="${values.join(',')}"`,
+                    );
+                    expect(
+                        ProxyUtils.parse(output)[0]['server-dns'],
+                    ).to.deep.equal(values);
+                }
+            }
+        }
+    });
+
+    it('keeps adjacent Loon options outside server-dns and supports script edits', function () {
+        const serverDns = [
+            '223.5.5.5',
+            '2001:db8::53',
+            'https://dns.example.com/dns-query?foo=bar',
+        ];
+
+        for (const quote of ['', '"']) {
+            const value = `${quote} ${serverDns.join(' , , ')} ${quote}`;
+            const [proxy] = ProxyUtils.parse(
+                `DNS=trojan,proxy.example.com,443,"secret",fast-open=true, server-dns = ${value},udp=false,tls-name=sni.example.com`,
+            );
+            expect(proxy['server-dns']).to.deep.equal(serverDns);
+            expect(proxy.tfo).to.equal(true);
+            expect(proxy.udp).to.equal(false);
+            expect(proxy.sni).to.equal('sni.example.com');
+
+            const [wireguard] = ProxyUtils.parse(
+                `WG=wireguard,interface-ip=10.0.0.2,private-key=private-key,server-dns=${value},mtu=1400,peers=[{endpoint=wg.example.com:51820,public-key=public-key}]`,
+            );
+            expect(wireguard['server-dns']).to.deep.equal(serverDns);
+            expect(wireguard.mtu).to.equal(1400);
+            expect(wireguard.server).to.equal('wg.example.com');
+
+            proxy['server-dns'] = ['quic://dns.example.com'];
+            expect(produceExternal('Loon', proxy)).to.include(
+                ',server-dns="quic://dns.example.com"',
+            );
+            proxy['server-dns'] = [];
+            expect(produceExternal('Loon', proxy)).not.to.include(
+                'server-dns=',
+            );
+            delete proxy['server-dns'];
+            expect(produceExternal('Loon', proxy)).not.to.include(
+                'server-dns=',
+            );
+        }
+    });
+
     it('produces Loon VLESS reality websocket lines', function () {
         const output = produceExternal('Loon', {
             type: 'vless',
@@ -773,7 +864,7 @@ describe('Proxy text producers', function () {
             },
         ]);
 
-        expect(output.match(/tls-profile=chrome/g)).to.have.length(9);
+        expect(output.match(/tls-profile=chrome147(?=,|$)/gm)).to.have.length(9);
         expect(output.match(/alpn="http\/1\.1,h2,h3"/g)).to.have.length(9);
     });
 
@@ -799,6 +890,10 @@ describe('Proxy text producers', function () {
                 _loon_tls_profile: 'chrome',
                 'client-fingerprint': 'ios',
             }),
+            buildTrojan('Loon Source Chrome147', {
+                _loon_tls_profile: 'chrome147',
+                'client-fingerprint': 'ios',
+            }),
             buildTrojan('Loon Fallback Chrome', {
                 'client-fingerprint': 'chrome',
             }),
@@ -810,9 +905,10 @@ describe('Proxy text producers', function () {
         expect(output).to.include('Loon Source IOS18=trojan');
         expect(output).to.include('tls-profile=ios18');
         expect(output).to.include('tls-profile=default');
-        expect(output).to.include('tls-profile=chrome');
+        expect(output).to.match(/tls-profile=chrome(?=,|$)/m);
+        expect(output.match(/tls-profile=chrome147(?=,|$)/gm)).to.have.length(2);
         expect(output).to.include('tls-profile=ios26');
-        expect(output.match(/tls-profile=/g)).to.have.length(5);
+        expect(output.match(/tls-profile=/g)).to.have.length(6);
     });
 
     it('omits invalid Loon tls-profile fallback values', function () {
@@ -2736,7 +2832,7 @@ describe('Proxy text producers', function () {
         }
     });
 
-    it('rejects non-AEAD VMess REALITY URI exports without changing authentication', function () {
+    it('rejects non-AEAD VMess conversion to query URIs for REALITY', function () {
         for (const auth of [{ alterId: 64 }, { aead: false }]) {
             const { result, errors } = captureErrors(() =>
                 ProxyUtils.produce(
@@ -2756,7 +2852,107 @@ describe('Proxy text producers', function () {
             );
             expect(result).to.equal('');
             expect(errors.join('\n')).to.include(
-                'VMess REALITY URI requires AEAD',
+                'VMess query URI format cannot represent non-AEAD authentication',
+            );
+        }
+    });
+
+    it('preserves finalmask as _finalmask through VLESS and VMess AEAD URI round-trips', function () {
+        const fm = JSON.stringify(
+            {
+                udp: [
+                    {
+                        type: 'salamander',
+                        settings: { password: 'a&b=c#d%2F+ /中文' },
+                    },
+                ],
+            },
+            null,
+            2,
+        );
+        for (const type of ['vless', 'vmess']) {
+            for (const security of ['none', 'tls', 'reality']) {
+                const input = `${type}://${UUID}@[2001:db8::1]:443?security=${security}${
+                    security === 'reality' ? '&pbk=pubkey' : ''
+                }&encryption=none&fm=${encodeURIComponent(
+                    fm,
+                )}#Finalmask%20%23%20test`;
+                const [proxy] = ProxyUtils.parse(input);
+                expect(proxy._finalmask).to.deep.equal(JSON.parse(fm));
+                expect(proxy).not.to.have.property('finalmask');
+                proxy._finalmask.udp[0].settings.password += ' edited';
+                for (const platform of ['URI', 'V2Ray']) {
+                    const output = produceExternal(platform, proxy);
+                    const uri =
+                        platform === 'V2Ray' ? Base64.decode(output) : output;
+                    expect(uri).to.include(
+                        `&fm=${encodeURIComponent(
+                            JSON.stringify(proxy._finalmask),
+                        )}`,
+                    );
+                    const [reparsed] = ProxyUtils.parse(output);
+                    expect(reparsed).to.include({
+                        type,
+                        name: 'Finalmask # test',
+                        server: '2001:db8::1',
+                    });
+                    expect(reparsed._finalmask).to.deep.equal(proxy._finalmask);
+                    if (type === 'vmess') {
+                        expect(reparsed.cipher).to.equal('none');
+                        expect(reparsed.alterId).to.equal(0);
+                    }
+                }
+                const mihomo = produceExternal('Mihomo', proxy);
+                expect(mihomo).not.to.include('_finalmask');
+                expect(mihomo).not.to.include('salamander');
+            }
+        }
+    });
+
+    it('preserves finalmask string overrides and falls back to raw text for invalid or non-object JSON', function () {
+        for (const type of ['vless', 'vmess']) {
+            for (const [fm, expected] of [
+                [' { "udp": [] } ', { udp: [] }],
+                ...['{bad', 'null', 'false', '0', '[]', '"raw"'].map(
+                    (value) => [value, value],
+                ),
+            ]) {
+                const uri = produceExternal('URI', {
+                    type,
+                    name: 'Finalmask String',
+                    server: 'example.com',
+                    port: 443,
+                    uuid: UUID,
+                    _finalmask: fm,
+                });
+                expect(new URL(uri).searchParams.get('fm')).to.equal(fm);
+                const [proxy] = ProxyUtils.parse(uri);
+                expect(proxy._finalmask).to.deep.equal(expected);
+            }
+        }
+    });
+
+    it('rejects non-AEAD VMess conversion to query URIs for finalmask', function () {
+        for (const auth of [{ alterId: 64 }, { aead: false }]) {
+            const { result, errors } = captureErrors(() =>
+                ProxyUtils.produce(
+                    [
+                        {
+                            type: 'vmess',
+                            name: 'Legacy VMess Finalmask',
+                            server: 'example.com',
+                            port: 443,
+                            uuid: UUID,
+                            _finalmask: '{}',
+                            ...auth,
+                        },
+                    ],
+                    'URI',
+                ),
+            );
+            expect(result).to.equal('');
+            expect(errors.join('\n')).to.include(
+                'VMess query URI format cannot represent non-AEAD authentication',
             );
         }
     });
