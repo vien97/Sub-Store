@@ -142,3 +142,6 @@ CHANGELOG.md
 CODEMAP.md
 CONTEXT_BUNDLE.md
 mydocs
+.vercel
+.env.local
+.env.*.local
