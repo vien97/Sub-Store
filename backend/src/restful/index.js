@@ -13,6 +13,7 @@ import { gistBackupAction } from '@/restful/miscs';
 import { SETTINGS_KEY } from '@/constants';
 import { startArtifactCronJobs } from '@/utils/artifact-cron';
 import { createFrontendStaticMiddleware } from '@/utils/frontend-static';
+import { createSpeedInsightsMiddleware } from '@/utils/speed-insights';
 
 import registerSubscriptionRoutes from './subscriptions';
 import registerCollectionRoutes from './collections';
@@ -131,6 +132,10 @@ export default function serve() {
             });
         }
     }
+    
+    // Add Vercel Speed Insights middleware
+    $app.use(createSpeedInsightsMiddleware($));
+    
     // register routes
     registerCollectionRoutes($app);
     registerSubscriptionRoutes($app);

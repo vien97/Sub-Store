@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@maxmind/geoip2-node": "^5.0.0",
+    "@vercel/speed-insights": "^2.1.0",
     "age-encryption": "^0.3.0",
     "body-parser": "^1.19.0",
     "buffer": "^6.0.3",
