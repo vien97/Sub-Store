@@ -142,3 +142,5 @@ CHANGELOG.md
 CODEMAP.md
 CONTEXT_BUNDLE.md
 mydocs
+# Vercel build artifact
+api/sub-store-serverless.min.js
