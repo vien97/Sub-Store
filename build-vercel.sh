@@ -8,3 +8,4 @@ npx --yes pnpm@11.0.9 install --no-frozen-lockfile
 node bundle-vercel.js
 
 mkdir -p ../public
+printf 'Sub-Store deployment placeholder\n' > ../public/__build_placeholder.txt
