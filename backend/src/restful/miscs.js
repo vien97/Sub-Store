@@ -24,6 +24,7 @@ import {
     encryptArmor,
     isAgeArmor,
 } from '@/utils/age';
+import { isSpeedInsightsEnabled } from '@/utils/speed-insights';
 
 const GIST_TOKEN_PATH = 'settings.gistToken';
 const GIST_DOWNLOAD_TOKEN_STRATEGY_PATH = 'settings.gistDownloadTokenStrategy';
@@ -128,6 +129,10 @@ function getEnv(req, res) {
     if (req.query.share) {
         env.feature.share = true;
     }
+    env.speedInsights = {
+        enabled: isSpeedInsightsEnabled(),
+        note: 'Speed Insights is automatically enabled on Vercel for frontend pages. Set DISABLE_SPEED_INSIGHTS=true to disable.',
+    };
     res.set('Content-Type', 'application/json;charset=UTF-8').send(
         JSON.stringify(
             {

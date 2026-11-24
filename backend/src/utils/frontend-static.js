@@ -1,3 +1,5 @@
+import { createSpeedInsightsMiddleware, isSpeedInsightsEnabled } from './speed-insights';
+
 const GZIP_SUFFIX = '.gz';
 const HASHED_ASSET = /-[0-9a-f]{8}\.[^/\\]+$/i;
 
@@ -44,23 +46,30 @@ export function createFrontendStaticMiddleware(root, fallbackPath) {
         req.url = originalUrl;
     }
 
-    if (!fallbackPath) return serveFile;
+    const middleware = !fallbackPath
+        ? serveFile
+        : (req, res, next) => {
+              const originalUrl = req.url;
+              serveFile(req, res, (error) => {
+                  if (error) {
+                      next(error);
+                      return;
+                  }
+                  req.url = fallbackPath;
+                  serveFile(req, res, (fallbackError) => {
+                      req.url = originalUrl;
+                      next(fallbackError);
+                  });
+                  req.url = originalUrl;
+              });
+          };
 
-    return (req, res, next) => {
-        const originalUrl = req.url;
-        serveFile(req, res, (error) => {
-            if (error) {
-                next(error);
-                return;
-            }
-            req.url = fallbackPath;
-            serveFile(req, res, (fallbackError) => {
-                req.url = originalUrl;
-                next(fallbackError);
-            });
-            req.url = originalUrl;
-        });
-    };
+    // Wrap with Speed Insights injection if enabled
+    if (isSpeedInsightsEnabled()) {
+        return createSpeedInsightsMiddleware(middleware);
+    }
+
+    return middleware;
 }
 
 function appendGzipSuffix(url) {
