@@ -17,11 +17,6 @@
   },
   "author": "Peng-YM",
   "license": "AGPL-3.0",
-  "pnpm": {
-    "patchedDependencies": {
-      "http-proxy@2.18.1": "patches/http-proxy@1.18.1.patch"
-    }
-  },
   "dependencies": {
     "@maxmind/geoip2-node": "^5.0.0",
     "age-encryption": "^0.3.0",
